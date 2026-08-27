@@ -1,0 +1,36 @@
+{
+  "ranAt": "2026-08-27T21:56:48.410Z",
+  "network": "testnet",
+  "admin": "GBLS7PL5Y65DHQIPMJO6HVQLX4FXEEHQDWHGSBUTGT4V6ZV2IOACYC2P",
+  "txs": {
+    "faucet_G_payment": {
+      "txHash": "9f94bdcaee338890a759e22161a458f02d1b6ab7409e3ce3d410e9758adefe62",
+      "ledger": 4368847,
+      "expert": "https://stellar.expert/explorer/testnet/tx/9f94bdcaee338890a759e22161a458f02d1b6ab7409e3ce3d410e9758adefe62"
+    },
+    "faucet_C_sac_transfer": {
+      "txHash": "6400cea5163428207253a2db892396d6be33eec3a41315b634b9dc1c1cab9d54",
+      "ledger": 4368849,
+      "expert": "https://stellar.expert/explorer/testnet/tx/6400cea5163428207253a2db892396d6be33eec3a41315b634b9dc1c1cab9d54"
+    },
+    "mint_resident": {
+      "txHash": "d9b2c4afe393c3dbcb860cf3869caec2c78563c0b89f6005a432202e817f4f6c",
+      "ledger": 4368850,
+      "expert": "https://stellar.expert/explorer/testnet/tx/d9b2c4afe393c3dbcb860cf3869caec2c78563c0b89f6005a432202e817f4f6c"
+    },
+    "register_merchant": {
+      "txHash": "37d009d244bf9966fbedf592a9b6892bccd9e021b10f2e4107ec8606671c9869",
+      "ledger": 4368851,
+      "expert": "https://stellar.expert/explorer/testnet/tx/37d009d244bf9966fbedf592a9b6892bccd9e021b10f2e4107ec8606671c9869"
+    }
+  },
+  "checks": {
+    "health": "protocolVersion=28 adminUsdcStroops=13412750000",
+    "accountNotFound": "404 ACCOUNT_NOT_FOUND",
+    "noTrustline": "422 NO_TRUSTLINE",
+    "rateLimited": "429 retry-after=593",
+    "alreadyResident": "409 ALREADY_RESIDENT",
+    "merchantExists": "409 MERCHANT_EXISTS",
+    "barrioAdminNotSet": "404 BARRIO_ADMIN_NOT_SET"
+  }
+}
