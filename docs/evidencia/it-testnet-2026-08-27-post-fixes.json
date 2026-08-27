@@ -1,0 +1,32 @@
+{
+  "ranAt": "2026-08-27T22:34:54.798Z",
+  "network": "testnet",
+  "admin": "GBLS7PL5Y65DHQIPMJO6HVQLX4FXEEHQDWHGSBUTGT4V6ZV2IOACYC2P",
+  "txs": {
+    "faucet_G_payment": {
+      "txHash": "f555a8a99f4338fb6a51e737722aa2c1312c0f366d50b67b059f32248dec3bc3",
+      "ledger": 4369304,
+      "expert": "https://stellar.expert/explorer/testnet/tx/f555a8a99f4338fb6a51e737722aa2c1312c0f366d50b67b059f32248dec3bc3"
+    },
+    "mint_resident": {
+      "txHash": "9c144ce7d6852bfc0f0fc4dbc66b60a17c6b285dd6fbb55cec1046afe9b04f0a",
+      "ledger": 4369305,
+      "expert": "https://stellar.expert/explorer/testnet/tx/9c144ce7d6852bfc0f0fc4dbc66b60a17c6b285dd6fbb55cec1046afe9b04f0a"
+    },
+    "register_merchant": {
+      "txHash": "2c79eaebdd5de8b02e7679d94441017fbc32ff0da64d7d58992ac9ffbc90ea83",
+      "ledger": 4369306,
+      "expert": "https://stellar.expert/explorer/testnet/tx/2c79eaebdd5de8b02e7679d94441017fbc32ff0da64d7d58992ac9ffbc90ea83"
+    }
+  },
+  "checks": {
+    "health": "protocolVersion=28 adminUsdcStroops=13012750000",
+    "accountNotFound": "404 ACCOUNT_NOT_FOUND",
+    "noTrustline": "422 NO_TRUSTLINE",
+    "rateLimited": "429 retry-after=594",
+    "contractNotFound": "404 ACCOUNT_NOT_FOUND",
+    "alreadyResident": "409 ALREADY_RESIDENT",
+    "merchantExists": "409 MERCHANT_EXISTS",
+    "barrioAdminNotSet": "404 BARRIO_ADMIN_NOT_SET"
+  }
+}
