@@ -21,7 +21,7 @@ import Fastify, {
   type FastifyRequest,
   type preHandlerAsyncHookHandler,
 } from "fastify";
-import rateLimit from "@fastify/rate-limit";
+import rateLimit, { normalizeIP } from "@fastify/rate-limit";
 import { makeAuthHook } from "./auth.js";
 import type { Config } from "./config.js";
 import { RelayerError, isRelayerError } from "./errors.js";
@@ -38,6 +38,44 @@ import type { ServiceHooks, StellarService } from "./types.js";
 export const BODY_LIMIT_BYTES = 8192;
 export const IDEMPOTENCY_HEADER = "idempotency-key";
 export const IDEMPOTENCY_KEY_MAX_CHARS = 64;
+/** Cabecera que fly-proxy escribe con la IP real del cliente (el cliente no puede fijarla desde fuera). */
+export const CLIENT_IP_HEADER = "fly-client-ip";
+
+/**
+ * `trustProxy` como FUNCIÓN: solo se confía en el proxy de Fly (red privada
+ * 6PN, `fdaa::/16`) y en loopback (local / Docker / tests).
+ *
+ * Con `trustProxy: true` Fastify confiaba en TODOS los saltos y `req.ip`
+ * acababa siendo la entrada MÁS A LA IZQUIERDA de `X-Forwarded-For`, que la
+ * escribe el cliente (Fly solo APPENDEA la real al final). Resultado: el log
+ * (`remoteAddress` del serializer de pino) quedaba envenenado y cualquiera
+ * podía evadir el limitador por IP rotando el header. Un `trustProxy`
+ * numérico (hop count) tampoco sirve: Fastify 5 (`lib/request.js`,
+ * `getTrustProxyFn`) lo compila a `() => false` porque no puede validar al
+ * peer inmediato. Con esta función, `req.ip` = primer salto NO confiable
+ * empezando por el socket, es decir, la IP que Fly añadió al final.
+ */
+export function isTrustedProxy(addr: string): boolean {
+  return addr === "127.0.0.1" || addr === "::1" || addr.startsWith("fdaa:") || addr.startsWith("::ffff:127.");
+}
+
+/**
+ * Clave del limitador por IP: `Fly-Client-IP` (la escribe fly-proxy en cada
+ * request; no depende de `X-Forwarded-For`, que el cliente puede rellenar) y,
+ * si no viene (local, tests), la IP del socket. Se normaliza igual que hace
+ * el keyGenerator por defecto del plugin (IPv6 agrupado por /64) para que un
+ * cliente IPv6 no tenga 2^64 cubos gratis.
+ */
+export function clientIpKey(req: FastifyRequest): string {
+  const raw = req.headers[CLIENT_IP_HEADER];
+  const header = Array.isArray(raw) ? raw[0] : raw;
+  const ip = (header && header.trim()) || req.socket.remoteAddress || "unknown";
+  try {
+    return normalizeIP(ip);
+  } catch {
+    return ip;
+  }
+}
 
 export interface AppDeps {
   config: Config;
@@ -74,18 +112,20 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
      * de logger.ts); `logger` solo acepta opciones. */
     loggerInstance: deps.logger as FastifyBaseLogger,
     bodyLimit: BODY_LIMIT_BYTES,
-    trustProxy: true,
+    /* Ver `isTrustedProxy`: nunca `true` (XFF controlable por el cliente). */
+    trustProxy: isTrustedProxy,
     /* El log de cada request queda ACTIVADO (es el default). No se pasa
      * `disableRequestLogging: false` porque Fastify 5.12 lo marca deprecado
      * (FSTDEP023) y ensucia los logs con un aviso por instancia. */
   });
 
-  /* Capa por IP (X-Forwarded-For de Fly gracias a trustProxy). El plugin
+  /* Capa por IP, con clave = `Fly-Client-IP` (ver `clientIpKey`). El plugin
    * LANZA lo que devuelva errorResponseBuilder, así que devolvemos un
    * RelayerError y el setErrorHandler lo serializa como cualquier otro. */
   await app.register(rateLimit, {
     max: config.rates.perIpPerMinute,
     timeWindow: "1 minute",
+    keyGenerator: clientIpKey,
     addHeaders: {
       "x-ratelimit-limit": true,
       "x-ratelimit-remaining": true,
@@ -146,7 +186,11 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     return sendRelayerError(reply, new RelayerError("INTERNAL", "Error interno del relayer."));
   });
 
-  app.setNotFoundHandler((req, reply) =>
+  /* El handler 404 NO pasa por el limitador global del plugin (documentado en
+   * @fastify/rate-limit): hay que engancharlo a mano como preHandler, si no
+   * cualquier ruta inexistente es tráfico ilimitado. Cada 404 cuenta en el
+   * mismo cubo por IP que el resto de rutas. */
+  app.setNotFoundHandler({ preHandler: app.rateLimit() }, (req, reply) =>
     sendRelayerError(reply, new RelayerError("NOT_FOUND", "Ruta no encontrada.", { method: req.method })),
   );
 

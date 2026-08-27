@@ -8,6 +8,7 @@ import { buildApp } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
 import { RelayerError } from "../src/errors.js";
 import { createLogger } from "../src/logger.js";
+import { HEALTH_UPSTREAM_TIMEOUT_MS } from "../src/routes/health.js";
 import type { FaucetResult, ServiceHooks, StellarService, SubmitResult } from "../src/types.js";
 
 // ─── Config de test: admin aleatorio + deployments temporal ──────────────────
@@ -161,6 +162,133 @@ describe("GET /v1/health", () => {
     await app.inject({ method: "GET", url: "/v1/health" });
     await app.inject({ method: "GET", url: "/v1/health" });
     expect(service.health).toHaveBeenCalledTimes(1);
+  });
+
+  it("503 RPC_UNREACHABLE con envelope si el upstream se cuelga más de HEALTH_UPSTREAM_TIMEOUT_MS", async () => {
+    /* Solo se falsean setTimeout/clearTimeout: setImmediate/nextTick los usa
+     * light-my-request y con ellos falseados la inyección nunca terminaría. */
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let hung = 0;
+      const health = vi
+        .fn<StellarService["health"]>()
+        .mockImplementationOnce(
+          () =>
+            new Promise(() => {
+              hung += 1; // nunca resuelve: simula un RPC que acepta el socket y no contesta
+            }),
+        )
+        .mockResolvedValueOnce({ protocolVersion: 28, latestLedger: 1, adminUsdcStroops: "0" });
+      const { app } = await makeApp(fakeService({ health }));
+
+      const pending = app.inject({ method: "GET", url: "/v1/health" });
+      await vi.advanceTimersByTimeAsync(HEALTH_UPSTREAM_TIMEOUT_MS);
+      const res = await pending;
+      expect(hung).toBe(1);
+      expect(res.statusCode).toBe(503);
+      expect(res.json()).toEqual({
+        ok: false,
+        error: { code: "RPC_UNREACHABLE", message: "Stellar RPC/Horizon no respondieron a tiempo.", retryable: true },
+      });
+
+      /* El timeout no se cachea: la siguiente llamada vuelve al servicio y sale bien. */
+      const good = await app.inject({ method: "GET", url: "/v1/health" });
+      expect(good.statusCode).toBe(200);
+      expect(health).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("GET /v1/live", () => {
+  it("200 { ok, uptimeSeconds } sin key y sin llamar a service.health", async () => {
+    const service = fakeService();
+    const { app } = await makeApp(service);
+    const res = await app.inject({ method: "GET", url: "/v1/live" });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ ok: true, uptimeSeconds: expect.any(Number) });
+    expect(service.health).not.toHaveBeenCalled();
+  });
+
+  it("sigue respondiendo 200 aunque service.health lance (liveness ≠ health)", async () => {
+    const service = fakeService({
+      health: vi.fn(async () => {
+        throw new RelayerError("RPC_UNREACHABLE", "RPC caído");
+      }),
+    });
+    const { app } = await makeApp(service);
+    expect((await app.inject({ method: "GET", url: "/v1/health" })).statusCode).toBe(503);
+    expect((await app.inject({ method: "GET", url: "/v1/live" })).statusCode).toBe(200);
+  });
+});
+
+describe("limitador por IP", () => {
+  const LIMIT = { RATE_PER_IP_PER_MINUTE: "3" };
+
+  it("rotar X-Forwarded-For NO abre cubos nuevos: la 4ª y 5ª request → 429", async () => {
+    const { app } = await makeApp(fakeService(), LIMIT);
+    const codes: number[] = [];
+    for (let n = 1; n <= 5; n++) {
+      const res = await app.inject({
+        method: "GET",
+        url: "/v1/health",
+        headers: { "x-forwarded-for": `10.0.0.${n}, 1.1.1.1` },
+      });
+      codes.push(res.statusCode);
+      if (res.statusCode === 429) {
+        expect(res.json()).toMatchObject({ ok: false, error: { code: "RATE_LIMITED", retryable: true } });
+        expect(res.headers["retry-after"]).toBeDefined();
+      }
+    }
+    expect(codes).toEqual([200, 200, 200, 429, 429]);
+  });
+
+  it("Fly-Client-IP distinto SÍ separa cubos (es la clave del limitador)", async () => {
+    const { app } = await makeApp(fakeService(), LIMIT);
+    const hit = (ip: string) => app.inject({ method: "GET", url: "/v1/live", headers: { "fly-client-ip": ip } });
+    for (let i = 0; i < 3; i++) expect((await hit("203.0.113.10")).statusCode).toBe(200);
+    expect((await hit("203.0.113.10")).statusCode).toBe(429);
+    expect((await hit("203.0.113.11")).statusCode).toBe(200);
+    /* Sin header: cae al remoteAddress del socket (127.0.0.1 en inject), otro cubo. */
+    expect((await app.inject({ method: "GET", url: "/v1/live" })).statusCode).toBe(200);
+  });
+
+  it("trustProxy solo confía en loopback/Fly: req.ip no se envenena con X-Forwarded-For", async () => {
+    const { app } = await makeApp(fakeService());
+    const seen: string[] = [];
+    app.addHook("onRequest", async (req) => {
+      seen.push(req.ip);
+    });
+    /* Socket de un cliente directo (no es proxy): XFF se ignora por completo. */
+    await app.inject({
+      method: "GET",
+      url: "/v1/live",
+      remoteAddress: "203.0.113.5",
+      headers: { "x-forwarded-for": "10.0.0.1" },
+    });
+    /* Socket del proxy (loopback ≈ fdaa: de Fly): req.ip = ÚLTIMA entrada de
+     * XFF (la que añade Fly), nunca la primera (que escribe el cliente). */
+    await app.inject({
+      method: "GET",
+      url: "/v1/live",
+      remoteAddress: "127.0.0.1",
+      headers: { "x-forwarded-for": "10.0.0.1, 198.51.100.7" },
+    });
+    expect(seen).toEqual(["203.0.113.5", "198.51.100.7"]);
+  });
+
+  it("las rutas inexistentes también cuentan: la 4ª petición a un 404 → 429", async () => {
+    const { app } = await makeApp(fakeService(), LIMIT);
+    for (let i = 0; i < 3; i++) {
+      const res = await app.inject({ method: "GET", url: "/v1/no-existe" });
+      expect(res.statusCode).toBe(404);
+      expect(res.json()).toMatchObject({ ok: false, error: { code: "NOT_FOUND", retryable: false } });
+    }
+    const res = await app.inject({ method: "GET", url: "/v1/no-existe" });
+    expect(res.statusCode).toBe(429);
+    expect(res.json()).toMatchObject({ ok: false, error: { code: "RATE_LIMITED", retryable: true } });
+    expect(res.headers["retry-after"]).toBeDefined();
   });
 });
 
