@@ -23,6 +23,15 @@
  * poll dice FAILED (aplicada con fallo: definitivo). Si el deadline vence con
  * un hash en vuelo, devolvemos TX_TIMEOUT con ese hash y NO reconstruimos.
  *
+ * Presupuesto de tiempo. El deadline se comprueba ANTES de cada llamada RPC
+ * (`ensureBudget`): una llamada solo arranca si quedan más de
+ * `config.rpcRequestTimeoutMs` (el timeout HTTP del cliente), así que el job
+ * termina como muy tarde en deadline + timeout, siempre por debajo del
+ * `jobTimeoutMs` de la cola (config.ts valida la regla). Sin esto, la cola
+ * respondería TX_TIMEOUT con txHash null mientras este módulo seguía vivo y
+ * podía incluso ENVIAR un envelope nuevo en un rebuild. Un rebuild, además,
+ * exige presupuesto para getAccount + simulate + send como mínimo.
+ *
  * Nunca se loguea XDR completo ni `sim.error` por encima de nivel debug: el
  * texto del host puede ser largo y no es para el cliente.
  */
@@ -121,6 +130,29 @@ function isAllowlisted(config: Config, contractId: string): boolean {
 }
 
 /**
+ * Lanza TX_TIMEOUT si no queda presupuesto para UNA llamada RPC completa
+ * (remaining <= rpcRequestTimeoutMs). Se invoca justo antes de cada llamada.
+ * `txHash` es el envelope en vuelo, si lo hay: el cliente debe comprobarlo
+ * antes de reintentar; null significa que nada pudo aplicarse.
+ */
+function ensureBudget(ctx: Ctx, stage: string, txHash?: string): void {
+  const { config, logger } = ctx.deps;
+  const remaining = ctx.deadlineAt - ctx.now();
+  if (remaining > config.rpcRequestTimeoutMs) return;
+  logger.warn(
+    { label: ctx.label, stage, txHash: txHash ?? null, remainingMs: remaining, rpcTimeoutMs: config.rpcRequestTimeoutMs },
+    "submit: sin presupuesto de tiempo para otra llamada RPC",
+  );
+  throw new RelayerError(
+    "TX_TIMEOUT",
+    txHash
+      ? "La transacción fue enviada pero no se confirmó dentro del tiempo del relayer. Puede aplicarse todavía: comprueba el hash antes de reintentar."
+      : "Se agotó el tiempo del relayer antes de poder enviar la transacción.",
+    { txHash: txHash ?? null, stage },
+  );
+}
+
+/**
  * Convierte una simulación fallida en RelayerError. Exportado porque las
  * lecturas por simulación (reads.ts) mapean igual que el submit.
  */
@@ -186,9 +218,16 @@ export async function submitTransaction(deps: SubmitDeps, spec: SubmitSpec): Pro
         { txResult: outcome.txResult, txHash: priorHash, rebuilds: ctx.rebuilds },
       );
     }
-    if (ctx.deadlineAt - now() <= POLL_INTERVAL_MS) {
-      // No queda tiempo para otra vuelta completa. La anterior ya no puede
-      // aplicarse (o nunca fue aceptada), así que el cliente puede reintentar.
+    // Un rebuild son como mínimo getAccount + simulate + send (tres llamadas
+    // RPC, cada una acotada por rpcRequestTimeoutMs) y un poll. Sin ese
+    // presupuesto no se empieza: la tx anterior ya no puede aplicarse (o nunca
+    // fue aceptada), así que el cliente puede reintentar sin riesgo.
+    const rebuildBudgetMs = 3 * config.rpcRequestTimeoutMs + POLL_INTERVAL_MS;
+    if (ctx.deadlineAt - now() < rebuildBudgetMs) {
+      logger.warn(
+        { label, txResult: outcome.txResult, remainingMs: ctx.deadlineAt - now(), rebuildBudgetMs },
+        "submit: sin presupuesto de tiempo para reconstruir",
+      );
       throw new RelayerError("TX_TIMEOUT", "Se agotó el tiempo del relayer antes de poder reintentar la transacción.", {
         txHash: null,
         txResult: outcome.txResult,
@@ -206,6 +245,8 @@ export async function submitTransaction(deps: SubmitDeps, spec: SubmitSpec): Pro
 async function rpcWithRetry<T>(ctx: Ctx, stage: string, op: () => Promise<T>): Promise<T> {
   const { config, logger } = ctx.deps;
   for (let attempt = 1; ; attempt += 1) {
+    // Fuera del try: el TX_TIMEOUT no es un fallo de red que reintentar.
+    ensureBudget(ctx, stage);
     try {
       return await op();
     } catch (e) {
@@ -269,6 +310,10 @@ async function sendAndPoll(ctx: Ctx, built: Built): Promise<Outcome> {
 
   // (e) send loop — mismo envelope en cada intento.
   for (let attempt = 1; ; attempt += 1) {
+    // A partir del 2º intento el envelope ya pudo llegar a la red (un fallo de
+    // red puede ser de vuelta): el TX_TIMEOUT lleva el hash para que el
+    // cliente lo compruebe. En el 1º nada ha salido todavía → null.
+    ensureBudget(ctx, "sendTransaction", attempt > 1 ? built.hash : undefined);
     let sent: sdkRpc.Api.SendTransactionResponse;
     try {
       sent = await ctx.deps.rpc.sendTransaction(built.tx);
@@ -336,6 +381,9 @@ async function sendAndPoll(ctx: Ctx, built: Built): Promise<Outcome> {
     }
     await ctx.sleep(Math.min(POLL_INTERVAL_MS, remaining));
 
+    // Tras dormir puede no quedar presupuesto para la consulta: TX_TIMEOUT con
+    // el hash en vuelo, antes de que una llamada colgada rebase el deadline.
+    ensureBudget(ctx, "getTransaction", built.hash);
     let got: sdkRpc.Api.GetTransactionResponse;
     try {
       got = await ctx.deps.rpc.getTransaction(built.hash);
@@ -366,7 +414,7 @@ async function sendAndPoll(ctx: Ctx, built: Built): Promise<Outcome> {
       }
 
       case GetTxStatus.NOT_FOUND: {
-        const closeTime = await latestCloseTime(ctx, got);
+        const closeTime = await latestCloseTime(ctx, got, built.hash);
         if (closeTime !== undefined && closeTime > built.maxTime) {
           // El último ledger cerró después de maxTime y la tx no está: expiró
           // sin aplicarse (txTooLate) y ya no puede hacerlo.
@@ -414,9 +462,15 @@ async function backoffOrGiveUp(
  * propia respuesta de getTransaction; si falta, getLatestLedger. `undefined`
  * si no se puede saber (entonces no se declara expirada: solo manda el deadline).
  */
-async function latestCloseTime(ctx: Ctx, got: sdkRpc.Api.GetTransactionResponse): Promise<number | undefined> {
+async function latestCloseTime(
+  ctx: Ctx,
+  got: sdkRpc.Api.GetTransactionResponse,
+  txHash: string,
+): Promise<number | undefined> {
   const fromTx = Number(got.latestLedgerCloseTime);
   if (Number.isFinite(fromTx) && fromTx > 0) return fromTx;
+  // Fuera del try: sin presupuesto es TX_TIMEOUT (con el hash en vuelo), no "no se sabe".
+  ensureBudget(ctx, "getLatestLedger", txHash);
   try {
     const latest = await ctx.deps.rpc.getLatestLedger();
     const t = Number(latest.closeTime);

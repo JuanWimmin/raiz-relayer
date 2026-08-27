@@ -176,16 +176,22 @@ const ADAPTER_ERRORS: Record<number, ContractErrorSpec> = {
 };
 
 /**
- * Stellar Asset Contract — rs-soroban-env `contract_error.rs`.
+ * Stellar Asset Contract — rs-soroban-env `contract_error.rs` (enum
+ * ContractError, numerado desde 1: InternalError=1, OperationNotSupportedError=2,
+ * AlreadyInitializedError=3, UnauthorizedError=4, AuthenticationError=5,
+ * AccountMissingError=6, AccountIsNotClassic=7, NegativeAmountError=8,
+ * AllowanceError=9, BalanceError=10, BalanceDeauthorizedError=11,
+ * OverflowError=12, TrustlineMissingError=13, InsufficientAccountReserve=14,
+ * TooManyAccountSubentries=15).
  * OJO: NO copiar el mapeo `#7 → InsufficientBalance` de la app (SAC #7 es
  * AccountIsNotClassic). Los relevantes para el faucet son 6/10/11/13.
  */
 const SAC_ERRORS: Record<number, ContractErrorSpec> = {
   1: { name: "InternalError", code: "CONTRACT_ERROR", message: "Error interno del SAC." },
-  2: { name: "AlreadyInitializedError", code: "CONTRACT_ERROR", message: "SAC ya inicializado." },
-  3: { name: "UnauthorizedError", code: "CONTRACT_ERROR", message: "No autorizado en el SAC." },
-  4: { name: "AuthenticationError", code: "CONTRACT_ERROR", message: "Error de autenticación en el SAC." },
-  5: { name: "AccountMissingError", code: "ACCOUNT_NOT_FOUND", message: "La cuenta no existe en la red." },
+  2: { name: "OperationNotSupportedError", code: "CONTRACT_ERROR", message: "Operación no soportada por el SAC." },
+  3: { name: "AlreadyInitializedError", code: "CONTRACT_ERROR", message: "SAC ya inicializado." },
+  4: { name: "UnauthorizedError", code: "CONTRACT_ERROR", message: "No autorizado en el SAC." },
+  5: { name: "AuthenticationError", code: "CONTRACT_ERROR", message: "Error de autenticación en el SAC." },
   6: { name: "AccountMissingError", code: "ACCOUNT_NOT_FOUND", message: "La cuenta destino no existe en la red (fondéala primero con friendbot)." },
   7: { name: "AccountIsNotClassic", code: "CONTRACT_ERROR", message: "La cuenta no es una cuenta clásica." },
   8: { name: "NegativeAmountError", code: "CONTRACT_ERROR", message: "Monto negativo." },
@@ -194,6 +200,8 @@ const SAC_ERRORS: Record<number, ContractErrorSpec> = {
   11: { name: "BalanceDeauthorizedError", code: "TRUSTLINE_DEAUTHORIZED", message: "La trustline USDC de la cuenta destino está desautorizada." },
   12: { name: "OverflowError", code: "CONTRACT_ERROR", message: "Overflow en el SAC." },
   13: { name: "TrustlineMissingError", code: "NO_TRUSTLINE", message: "La cuenta destino no tiene trustline al USDC de Blend. La app debe crearla antes de pedir el faucet." },
+  14: { name: "InsufficientAccountReserve", code: "CONTRACT_ERROR", message: "La cuenta no tiene reserva de XLM suficiente para la operación del SAC." },
+  15: { name: "TooManyAccountSubentries", code: "CONTRACT_ERROR", message: "La cuenta tiene demasiadas subentradas para la operación del SAC." },
 };
 
 const TABLES: Partial<Record<ContractRole, Record<number, ContractErrorSpec>>> = {
@@ -225,7 +233,12 @@ export function mapContractError(
 // ─────────────────────────────────────────────────────────────────────────────
 
 const CONTRACT_ERROR_RE = /Error\(Contract, #(\d+)\)/;
-const CONTRACT_IN_LOG_RE = /contract:\s*(C[A-Z2-7]{55})/g;
+/**
+ * Línea del log de simulación que es un evento `error` con contractId
+ * (`contract:C…, topics:[error, …]`). Las líneas fn_call/fn_return también
+ * llevan `contract:C…` pero son frames del caller: no atribuyen el error.
+ */
+const ERROR_LINE_IN_LOG_RE = /contract:\s*(C[A-Z2-7]{55}).*topics:\s*\[\s*error/;
 
 export interface SimulationErrorLike {
   error: string;
@@ -241,8 +254,11 @@ export interface SimulationErrorLike {
  *     mismo N. Los eventos van en orden de emisión, así que el primero es el
  *     frame más interno (donde nació el error). Si ninguno trae el código,
  *     el primer evento "error" con contractId.
- *  2. Texto del log de la simulación (`Event log (newest first)`): el ÚLTIMO
- *     `contract:C…` listado es el más antiguo = más interno.
+ *  2. Texto del log de la simulación (`Event log (newest first)`): de las
+ *     líneas que son eventos `error` con `contract:C…`, la ÚLTIMA es la más
+ *     antigua = frame más interno. Las líneas fn_call/fn_return se ignoran:
+ *     en llamadas anidadas (Pool → adapter → SAC) el último `contract:C…` a
+ *     secas puede ser un fn_call del caller.
  *  3. El contrato invocado (targetContractId).
  */
 export function parseContractError(
@@ -297,8 +313,9 @@ function contractFromEvents(events: xdr.DiagnosticEvent[] | undefined, code: num
 
 function contractFromLogText(text: string): string | undefined {
   let last: string | undefined;
-  for (const m of text.matchAll(CONTRACT_IN_LOG_RE)) {
-    if (m[1]) last = m[1];
+  for (const line of text.split(/\r?\n/)) {
+    const m = ERROR_LINE_IN_LOG_RE.exec(line);
+    if (m?.[1]) last = m[1];
   }
   return last;
 }
@@ -348,8 +365,11 @@ export function mapPaymentOpResult(name: string, raw?: string): RelayerError {
     case "paymentUnderfunded":
       return new RelayerError("FAUCET_EMPTY", "El faucet no tiene USDC suficiente. Hay que re-fondear la cuenta admin (ver runbook del README).", details);
     case "paymentNoDestination":
-    case "opNoAccount":
       return new RelayerError("ACCOUNT_NOT_FOUND", "La cuenta destino no existe en la red (fondéala primero con friendbot).", details);
+    case "opNoAccount":
+      // opNoAccount = falta la cuenta ORIGEN de la operación (la admin del
+      // relayer), no el destino: es un fallo de despliegue, no del cliente.
+      return new RelayerError("INTERNAL", "La cuenta admin del relayer no existe en la red (relayer mal configurado).", details);
     case "paymentNotAuthorized":
       return new RelayerError("TRUSTLINE_DEAUTHORIZED", "La trustline USDC de la cuenta destino está desautorizada.", details);
     default:

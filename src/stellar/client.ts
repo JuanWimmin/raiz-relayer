@@ -16,15 +16,18 @@ export interface Clients {
 }
 
 /**
- * El timeout de 20 s por petición es deliberadamente menor que el deadline del
- * job (75 s): una llamada colgada nunca debe consumir sola todo el presupuesto
- * de tiempo, y así el bucle de reintentos de submit.ts puede reaccionar.
+ * El timeout por petición (`config.rpcRequestTimeoutMs`, 15 s por defecto) es
+ * deliberadamente menor que el deadline del job (70 s): una llamada colgada
+ * nunca debe consumir sola todo el presupuesto de tiempo, y submit.ts solo
+ * inicia una llamada si le queda más que ese timeout (ensureBudget). Se aplica
+ * a los DOS clientes: Horizon.Server no acepta `timeout` en el constructor,
+ * pero su httpClient (fetch) lo lee de `defaults` en cada petición.
  */
-const RPC_REQUEST_TIMEOUT_MS = 20_000;
-
 export function createClients(config: Config): Clients {
+  const horizon = new Horizon.Server(config.horizonUrl);
+  horizon.httpClient.defaults.timeout = config.rpcRequestTimeoutMs;
   return {
-    rpc: new rpc.Server(config.rpcUrl, { timeout: RPC_REQUEST_TIMEOUT_MS }),
-    horizon: new Horizon.Server(config.horizonUrl),
+    rpc: new rpc.Server(config.rpcUrl, { timeout: config.rpcRequestTimeoutMs }),
+    horizon,
   };
 }

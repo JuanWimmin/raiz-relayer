@@ -48,7 +48,7 @@ import {
   merchantDataToScVal,
   stroopsToDecimal,
 } from "./encode.js";
-import { adminUsdcBalanceStroops, loadHorizonAccount, merchantExists, networkInfo } from "./reads.js";
+import { adminUsdcBalanceStroops, contractExists, loadHorizonAccount, merchantExists, networkInfo } from "./reads.js";
 import { submitTransaction, type SubmitDeps, type SubmitSpec } from "./submit.js";
 
 export interface StellarServiceDeps {
@@ -87,8 +87,14 @@ export function createStellarService(deps: StellarServiceDeps): StellarService {
   });
 
   const run = (spec: SubmitSpec, hooks: ServiceHooks | undefined): Promise<SubmitResult> => {
+    const label = spec.label ?? spec.kind;
+    // Capacidad ANTES del hook: afterPreflight consume el cupo de rate-limit,
+    // y un QUEUE_FULL (503) no debe quemar el turno de 10 min del cliente.
+    // assertCapacity y enqueue van en el mismo tick síncrono, así que si el
+    // primero pasa, el segundo no puede rechazar por cupo.
+    queue.assertCapacity(label);
     hooks?.afterPreflight?.();
-    return queue.enqueue(() => submitTransaction(submitDeps, spec), spec.label ?? spec.kind);
+    return queue.enqueue(() => submitTransaction(submitDeps, spec), label);
   };
 
   const assertAddress = (address: string): { isContract: boolean } => {
@@ -123,9 +129,19 @@ export function createStellarService(deps: StellarServiceDeps): StellarService {
       const { isContract } = assertAddress(address);
       const amount = config.faucetAmountStroops;
 
-      if (!isContract) {
+      if (isContract) {
+        // C…: cualquier strkey válida "parece" una smart account, pero el SAC
+        // transfiere a direcciones sin desplegar igual (USDC irrecuperable) y
+        // eso evadiría la ventana por address con C… aleatorios. Preflight de
+        // existencia antes de nada.
+        if (!(await contractExists(clients.rpc, address, logger))) {
+          throw new RelayerError("ACCOUNT_NOT_FOUND", "El contrato destino no existe en la red (despliega la smart account primero).", {
+            address,
+          });
+        }
+      } else {
         // G…: Horizon nos dice de antemano lo que la op `payment` fallaría on-chain.
-        const info = await loadHorizonAccount(clients.horizon, address, config.usdcIssuer);
+        const info = await loadHorizonAccount(clients.horizon, address, config.usdcIssuer, logger);
         if (!info.exists) {
           throw new RelayerError("ACCOUNT_NOT_FOUND", "La cuenta destino no existe en la red (fondéala primero con friendbot).", {
             address,
@@ -144,7 +160,7 @@ export function createStellarService(deps: StellarServiceDeps): StellarService {
         }
       }
 
-      const balance = await adminUsdcBalanceStroops(clients.horizon, config);
+      const balance = await adminUsdcBalanceStroops(clients.horizon, config, logger);
       if (balance < amount) {
         logger.error({ adminUsdcStroops: balance.toString(), needed: amount.toString() }, "faucet: sin fondos");
         throw new RelayerError("FAUCET_EMPTY", "El faucet no tiene USDC suficiente. Hay que re-fondear la cuenta admin (ver runbook del README).", {
@@ -196,8 +212,8 @@ export function createStellarService(deps: StellarServiceDeps): StellarService {
 
     async health(): Promise<HealthSnapshot> {
       const [net, adminUsdc] = await Promise.all([
-        networkInfo(clients.rpc),
-        adminUsdcBalanceStroops(clients.horizon, config),
+        networkInfo(clients.rpc, logger),
+        adminUsdcBalanceStroops(clients.horizon, config, logger),
       ]);
       return { protocolVersion: net.protocolVersion, latestLedger: net.latestLedger, adminUsdcStroops: adminUsdc.toString() };
     },

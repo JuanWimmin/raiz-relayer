@@ -24,6 +24,9 @@ const NETWORK_PASSPHRASES = {
   testnet: Networks.TESTNET,
 } as const;
 
+/** Margen entre el peor caso del submit (deadline + una llamada RPC colgada) y el timeout duro de la cola. */
+const JOB_TIMEOUT_MARGIN_MS = 5_000;
+
 const boolFromEnv = z
   .string()
   .optional()
@@ -62,8 +65,9 @@ const envSchema = z.object({
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
   DEPLOYMENTS_FILE: z.string().default("config/deployments.testnet.json"),
   QUEUE_CAP: intFromEnv(20, 1),
-  JOB_DEADLINE_MS: intFromEnv(75_000, 5_000),
+  JOB_DEADLINE_MS: intFromEnv(70_000, 5_000),
   JOB_TIMEOUT_MS: intFromEnv(90_000, 5_000),
+  RPC_REQUEST_TIMEOUT_MS: intFromEnv(15_000, 1_000),
   SUBMIT_ATTEMPTS: intFromEnv(5, 1),
   SUBMIT_BACKOFF_MS: intFromEnv(3_000, 0),
   TX_TIMEOUT_SECONDS: intFromEnv(30, 10),
@@ -121,8 +125,12 @@ export interface Config {
   /** rol → address, solo los invocables. */
   contracts: Record<InvokableRole, string>;
   queueCap: number;
+  /** Presupuesto de tiempo del pipeline de submit (por job). */
   jobDeadlineMs: number;
+  /** Red de seguridad de la cola: debe cubrir deadline + una llamada RPC colgada + margen. */
   jobTimeoutMs: number;
+  /** Timeout HTTP de cada petición al RPC y a Horizon. */
+  rpcRequestTimeoutMs: number;
   submitAttempts: number;
   submitBackoffMs: number;
   txTimeoutSeconds: number;
@@ -213,6 +221,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): { config: Conf
     queueCap: e.QUEUE_CAP,
     jobDeadlineMs: e.JOB_DEADLINE_MS,
     jobTimeoutMs: e.JOB_TIMEOUT_MS,
+    rpcRequestTimeoutMs: e.RPC_REQUEST_TIMEOUT_MS,
     submitAttempts: e.SUBMIT_ATTEMPTS,
     submitBackoffMs: e.SUBMIT_BACKOFF_MS,
     txTimeoutSeconds: e.TX_TIMEOUT_SECONDS,
@@ -220,14 +229,29 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): { config: Conf
     healthCacheMs: e.HEALTH_CACHE_MS,
   };
   if (config.faucetAmountStroops <= 0n) throw new ConfigError("FAUCET_AMOUNT_STROOPS debe ser > 0.");
-  if (config.jobDeadlineMs >= config.jobTimeoutMs) {
-    throw new ConfigError("JOB_DEADLINE_MS debe ser menor que JOB_TIMEOUT_MS.");
+  // submit.ts solo inicia una llamada RPC si quedan > rpcRequestTimeoutMs de
+  // deadline, y cada llamada está acotada por ese timeout HTTP: el job termina
+  // como muy tarde en deadline + timeout. El timeout de la cola debe cubrir
+  // eso con margen; si no, la cola respondería TX_TIMEOUT (txHash null)
+  // mientras el submit sigue vivo y podría incluso enviar un envelope nuevo.
+  const minJobTimeoutMs = config.jobDeadlineMs + config.rpcRequestTimeoutMs + JOB_TIMEOUT_MARGIN_MS;
+  if (config.jobTimeoutMs < minJobTimeoutMs) {
+    throw new ConfigError(
+      `JOB_TIMEOUT_MS (${config.jobTimeoutMs}) debe ser >= JOB_DEADLINE_MS + RPC_REQUEST_TIMEOUT_MS + ${JOB_TIMEOUT_MARGIN_MS} ` +
+        `(= ${config.jobDeadlineMs} + ${config.rpcRequestTimeoutMs} + ${JOB_TIMEOUT_MARGIN_MS} = ${minJobTimeoutMs}).`,
+    );
   }
   return { config, adminKeypair };
 }
 
-/** Versión segura para logs (sin appKey). */
+/** Versión segura para logs (sin appKey; URLs reducidas al origen por si llevan credenciales o tokens en el path). */
 export function redactConfig(c: Config): Record<string, unknown> {
   const { appKey: _appKey, deployments: _d, rolesByAddress: _r, ...rest } = c;
-  return { ...rest, faucetAmountStroops: c.faucetAmountStroops.toString() };
+  // rpcUrl/horizonUrl ya pasaron z.url(), así que `new URL` no lanza.
+  return {
+    ...rest,
+    rpcUrl: new URL(c.rpcUrl).origin,
+    horizonUrl: new URL(c.horizonUrl).origin,
+    faucetAmountStroops: c.faucetAmountStroops.toString(),
+  };
 }

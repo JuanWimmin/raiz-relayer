@@ -116,6 +116,25 @@ describe("mapContractError", () => {
     expect(mapContractError("usdc_sac", 6).code).toBe("ACCOUNT_NOT_FOUND");
   });
 
+  it("usdc_sac #1-#5 siguen la numeración de rs-soroban-env (sin desplazamiento) y #14/#15 existen", () => {
+    // contract_error.rs: InternalError=1, OperationNotSupportedError=2,
+    // AlreadyInitializedError=3, UnauthorizedError=4, AuthenticationError=5.
+    const names = [1, 2, 3, 4, 5, 6, 7, 14, 15].map((n) => mapContractError("usdc_sac", n).details?.name);
+    expect(names).toEqual([
+      "InternalError",
+      "OperationNotSupportedError",
+      "AlreadyInitializedError",
+      "UnauthorizedError",
+      "AuthenticationError",
+      "AccountMissingError",
+      "AccountIsNotClassic",
+      "InsufficientAccountReserve",
+      "TooManyAccountSubentries",
+    ]);
+    // Solo #6 es "cuenta inexistente"; #5 (AuthenticationError) ya no lo es.
+    for (const n of [1, 2, 3, 4, 5, 14, 15]) expect(mapContractError("usdc_sac", n).code, `#${n}`).toBe("CONTRACT_ERROR");
+  });
+
   it("código desconocido o contrato sin tabla → CONTRACT_ERROR genérico con contractCode", () => {
     const e = mapContractError("pool", 99, POOL);
     expect(e.code).toBe("CONTRACT_ERROR");
@@ -175,6 +194,26 @@ describe("parseContractError", () => {
       `1: [Diagnostic Event] contract:${ADAPTER}, topics:[error, Error(Contract, #5)], data:"insufficient shares"`;
     expect(parseContractError({ error: text, events: [] }, POOL)).toEqual({ code: 5, contractId: ADAPTER });
     expect(parseContractError({ error: text }, POOL)?.contractId).toBe(ADAPTER);
+  });
+
+  it("fallback por texto: ignora fn_call/fn_return del caller y elige el ÚLTIMO evento 'error' con contract", () => {
+    // Log realista (newest first) de Pool.redeem_from_vault → adapter.withdraw
+    // → SAC.balance: el último `contract:C…` a secas es un fn_call del Pool
+    // (línea 4), pero el frame que falló es el adapter (línea 1).
+    const SAC = deployments.usdc_sac;
+    const text =
+      `${ERR5}0: [Diagnostic Event] contract:${POOL}, topics:[error, Error(Contract, #5)], data:"escalating error"\n` +
+      `1: [Diagnostic Event] contract:${ADAPTER}, topics:[error, Error(Contract, #5)], data:"insufficient shares"\n` +
+      `2: [Diagnostic Event] contract:${POOL}, topics:[fn_call, ${ADAPTER}, withdraw], data:[Bytes(ce47…), 100]\n` +
+      `3: [Diagnostic Event] contract:${SAC}, topics:[fn_return, balance], data:0\n` +
+      `4: [Diagnostic Event] contract:${POOL}, topics:[fn_call, ${SAC}, balance], data:${ADAPTER}\n` +
+      `5: [Diagnostic Event] topics:[fn_call, ${POOL}, redeem_from_vault], data:[Bytes(ce47…), 100]`;
+    expect(parseContractError({ error: text, events: [] }, POOL)).toEqual({ code: 5, contractId: ADAPTER });
+  });
+
+  it("fallback por texto: si ninguna línea es un evento 'error' con contract, cae al target", () => {
+    const text = `${ERR5}0: [Diagnostic Event] contract:${ADAPTER}, topics:[fn_call, withdraw], data:[]`;
+    expect(parseContractError({ error: text, events: [] }, POOL)?.contractId).toBe(POOL);
   });
 
   it("fallback al target cuando no hay eventos ni contract:C… en el texto", () => {
@@ -240,8 +279,15 @@ describe("mapPaymentOpResult", () => {
     expect(mapPaymentOpResult("paymentNoTrust").code).toBe("NO_TRUSTLINE");
     expect(mapPaymentOpResult("paymentUnderfunded").code).toBe("FAUCET_EMPTY");
     expect(mapPaymentOpResult("paymentNoDestination").code).toBe("ACCOUNT_NOT_FOUND");
-    expect(mapPaymentOpResult("opNoAccount").code).toBe("ACCOUNT_NOT_FOUND");
     expect(mapPaymentOpResult("paymentNotAuthorized").code).toBe("TRUSTLINE_DEAUTHORIZED");
+  });
+
+  it("opNoAccount es la cuenta ORIGEN (admin) ausente → INTERNAL, no ACCOUNT_NOT_FOUND", () => {
+    const e = mapPaymentOpResult("opNoAccount", "txFailed");
+    expect(e.code).toBe("INTERNAL");
+    expect(e.http).toBe(500);
+    expect(e.message).toContain("admin");
+    expect(e.details).toEqual({ opResult: "opNoAccount", txResult: "txFailed" });
   });
 
   it("otros → TX_FAILED con details.opResult y txResult", () => {

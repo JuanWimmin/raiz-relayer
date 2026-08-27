@@ -61,19 +61,23 @@ export class SerialQueue {
   }
 
   /**
+   * Lanza el MISMO QUEUE_FULL que `enqueue` si no hay sitio, sin ocupar plaza.
+   * Sirve para comprobar la capacidad ANTES de efectos irreversibles del
+   * llamador (p. ej. consumir el cupo de rate-limit): como es síncrono, si no
+   * lanza, un `enqueue` inmediato en el mismo tick está garantizado.
+   */
+  assertCapacity(label = "job"): void {
+    const full = this.queueFullError(label);
+    if (full) throw full;
+  }
+
+  /**
    * Encola `fn`. Resuelve/rechaza con lo que devuelva `fn`, o con TX_TIMEOUT si
    * supera `jobTimeoutMs`. Rechaza de inmediato con QUEUE_FULL si no hay sitio.
    */
   enqueue<T>(fn: () => Promise<T>, label = "job"): Promise<T> {
-    if (this.count >= this.cap) {
-      this.logger?.warn({ label, pending: this.count, cap: this.cap }, "cola: llena, rechazando job");
-      return Promise.reject(
-        new RelayerError("QUEUE_FULL", "El relayer está saturado en este momento; reintenta en unos segundos.", {
-          pending: this.count,
-          cap: this.cap,
-        }),
-      );
-    }
+    const full = this.queueFullError(label);
+    if (full) return Promise.reject(full);
     this.count += 1;
     const jobId = ++this.seq;
     const run = this.tail.then(() => this.runOne(fn, label, jobId));
@@ -89,6 +93,16 @@ export class SerialQueue {
     while (this.count > 0) {
       await this.tail;
     }
+  }
+
+  /** Único punto que construye QUEUE_FULL (mensaje y details idénticos en assertCapacity y enqueue). */
+  private queueFullError(label: string): RelayerError | undefined {
+    if (this.count < this.cap) return undefined;
+    this.logger?.warn({ label, pending: this.count, cap: this.cap }, "cola: llena, rechazando job");
+    return new RelayerError("QUEUE_FULL", "El relayer está saturado en este momento; reintenta en unos segundos.", {
+      pending: this.count,
+      cap: this.cap,
+    });
   }
 
   private async runOne<T>(fn: () => Promise<T>, label: string, jobId: number): Promise<T> {

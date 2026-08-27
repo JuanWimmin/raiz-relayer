@@ -131,6 +131,40 @@ describe("SerialQueue", () => {
     await expect(q.enqueue(async () => "si")).resolves.toBe("si");
   });
 
+  it("assertCapacity lanza el MISMO QUEUE_FULL que enqueue al llegar al cap y no ocupa plaza", async () => {
+    const q = new SerialQueue({ cap: 2, jobTimeoutMs: 60_000, logger });
+    expect(() => q.assertCapacity("faucet")).not.toThrow();
+    expect(q.pending()).toBe(0);
+
+    const gate = deferred<void>();
+    const p1 = q.enqueue(() => gate.promise);
+    const p2 = q.enqueue(() => gate.promise);
+    expect(q.pending()).toBe(2);
+
+    let thrown: unknown;
+    try {
+      q.assertCapacity("faucet");
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(RelayerError);
+    const a = thrown as RelayerError;
+    const b = await relayerError(q.enqueue(async () => "no", "faucet"));
+    expect(a.code).toBe("QUEUE_FULL");
+    expect(a.http).toBe(503);
+    expect(a.retryable).toBe(true);
+    expect(a.message).toBe(b.message);
+    expect(a.details).toEqual(b.details);
+    expect(a.details).toEqual({ pending: 2, cap: 2 });
+    // Ni assertCapacity ni el enqueue rechazado ocupan sitio.
+    expect(q.pending()).toBe(2);
+
+    gate.resolve();
+    await Promise.all([p1, p2]);
+    expect(q.pending()).toBe(0);
+    expect(() => q.assertCapacity()).not.toThrow();
+  });
+
   it("timeout → TX_TIMEOUT con txHash null y la cola continúa con el siguiente", async () => {
     const q = new SerialQueue({ cap: 10, jobTimeoutMs: 1_000, logger });
     const zombie = deferred<string>();

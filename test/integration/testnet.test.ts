@@ -6,7 +6,10 @@
  *   RELAYER_IT=1 RELAYER_ADMIN_SECRET=$(stellar keys show raiz-admin) \
  *   RELAYER_APP_KEY=test-key-0123456789abcdef npx vitest run test/integration
  *
- * Mueve USDC de verdad (de testnet) desde la cuenta admin: 2 faucets de 20 USDC.
+ * Mueve USDC de verdad (de testnet) desde la cuenta admin: 1 faucet de 20 USDC
+ * a una G… fresca y, solo si se define RELAYER_IT_SMART_ACCOUNT (un C…
+ * DESPLEGADO en testnet), otro a esa smart account vía SAC. Un C… aleatorio ya
+ * no recibe nada: el relayer exige que el contrato exista (404 si no).
  * Escribe los hashes en RELAYER_IT_OUT (o <tmpdir>/raiz-relayer-it.json) para
  * la evidencia del SOW (D1).
  */
@@ -36,6 +39,14 @@ const describeIt = IT ? describe : describe.skip;
 /** Barrio "Centro Histórico" del seed (scripts/seed_testnet.sh). */
 const BARRIO_CENTRO = "ce47120000000000000000000000000000000000000000000000000000000001";
 
+/**
+ * C… desplegado de verdad (smart account) para el faucet vía SAC. Sin él, el
+ * caso positivo se salta: no hay forma de que un C… inventado pase el
+ * preflight de existencia, y desplegar una smart account no es cosa de este test.
+ */
+const SMART_ACCOUNT = process.env.RELAYER_IT_SMART_ACCOUNT;
+const itWithSmartAccount = SMART_ACCOUNT ? it : it.skip;
+
 interface Evidence {
   ranAt: string;
   network: string;
@@ -54,7 +65,7 @@ describeIt("relayer contra testnet (RELAYER_IT=1)", () => {
   // Cuentas de prueba frescas (no se persisten: cada run usa unas nuevas).
   const residentKp = Keypair.random(); // G… que recibe faucet + soulbound
   const merchantKp = Keypair.random(); // G… que se registra como comercio (no necesita fondos)
-  const smartAccount = StrKey.encodeContract(randomBytes(32)); // C… destino del SAC transfer
+  const missingContract = StrKey.encodeContract(randomBytes(32)); // C… válido como strkey pero sin desplegar
 
   const post = async (url: string, body: unknown, headers: Record<string, string> = {}): Promise<InjectResponse> =>
     app.inject({ method: "POST", url, payload: body as Record<string, unknown>, headers: { "x-raiz-app-key": appKey, ...headers } });
@@ -145,13 +156,28 @@ describeIt("relayer contra testnet (RELAYER_IT=1)", () => {
     evidence.checks.rateLimited = `429 retry-after=${String(res.headers["retry-after"])}`;
   });
 
-  it("faucet a un C… → 200 (SAC transfer)", async () => {
-    const res = await post("/v1/faucet", { address: smartAccount });
-    expect(res.statusCode, res.body).toBe(200);
+  it("faucet a un C… sin desplegar → 404 ACCOUNT_NOT_FOUND (no se quema USDC en direcciones inventadas)", async () => {
+    const res = await post("/v1/faucet", { address: missingContract });
+    expect(res.statusCode, res.body).toBe(404);
     const body = res.json();
-    expect(body.method).toBe("sac_transfer");
-    record("faucet_C_sac_transfer", body);
-  }, 180_000);
+    expect(body.error.code).toBe("ACCOUNT_NOT_FOUND");
+    expect(body.error.message).toContain("smart account");
+    evidence.checks.contractNotFound = "404 ACCOUNT_NOT_FOUND";
+  }, 60_000);
+
+  itWithSmartAccount(
+    "faucet a un C… desplegado (RELAYER_IT_SMART_ACCOUNT) → 200 (SAC transfer) — SKIP si la variable no está definida",
+    async () => {
+      const res = await post("/v1/faucet", { address: SMART_ACCOUNT });
+      expect(res.statusCode, res.body).toBe(200);
+      const body = res.json();
+      expect(body.ok).toBe(true);
+      expect(body.method).toBe("sac_transfer");
+      expect(body.txHash).toMatch(/^[0-9a-f]{64}$/);
+      record("faucet_C_sac_transfer", body);
+    },
+    180_000,
+  );
 
   it("mint-resident → 200; repetido → 409 ALREADY_RESIDENT", async () => {
     const res = await post("/v1/mint-resident", { address: residentKp.publicKey(), barrioId: BARRIO_CENTRO });
