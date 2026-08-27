@@ -1,0 +1,44 @@
+# fly.toml — raiz-relayer (Stellar testnet)
+#
+# ⚠️  DESPLEGAR SIEMPRE CON:   fly deploy --ha=false
+#
+# Este servicio debe correr en UNA ÚNICA MÁQUINA. El relayer serializa todas las
+# transacciones en una cola en memoria porque firma con una sola cuenta admin
+# (un solo sequence number). Dos máquinas = dos colas que se pisan la secuencia
+# → txBadSeq intermitentes, reintentos inútiles y cupos duplicados. `fly deploy`
+# sin `--ha=false` crea 2 máquinas por defecto: no lo hagas.
+#
+# Secretos (nunca aquí):  fly secrets set RELAYER_ADMIN_SECRET=… RELAYER_APP_KEY=…
+
+app = "raiz-relayer"
+primary_region = "bog"
+# Margen para que SIGTERM drene la cola (un job puede tardar hasta JOB_TIMEOUT_MS = 90 s).
+kill_timeout = 120
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  NETWORK = "testnet"
+  PORT = "8080"
+  LOG_LEVEL = "info"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Nunca apagar la máquina: los contadores de cupos y la cola viven en memoria,
+  # y el arranque en frío añadiría latencia a un flujo que ya tarda segundos.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    grace_period = "15s"
+    interval = "30s"
+    method = "GET"
+    timeout = "5s"
+    path = "/v1/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
