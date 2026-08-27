@@ -10,10 +10,12 @@ endpoints está en el [README](../README.md); aquí solo va lo que afecta al có
 - **Header obligatorio en todos los POST**: `x-raiz-app-key: ${BuildConfig.RELAYER_APP_KEY}`
   (`local.properties` → `BuildConfig`; nunca en el repo). `GET /v1/health` no lo necesita.
 - **`content-type: application/json`**, body ≤ 8 KB (413 `PAYLOAD_TOO_LARGE` si no).
-- **Timeout HTTP del cliente ≥ 90 s** (`requestTimeoutMillis = 90_000`, y `socketTimeoutMillis`
-  igual). El relayer serializa una cola y cada job tiene un deadline de 75 s con propagación RPC y
-  reintentos internos; un timeout de 30 s en la app cortaría respuestas válidas. Muestra spinner
-  con texto tipo "Firmando en la red… puede tardar hasta un minuto".
+- **Timeout HTTP del cliente ≥ 95 s** (`requestTimeoutMillis = 95_000`, y `socketTimeoutMillis`
+  igual). El relayer serializa una cola y cada job tiene un deadline de 70 s (`JOB_DEADLINE_MS`)
+  más hasta 15 s de la request al RPC que estuviera en vuelo al vencer (`RPC_REQUEST_TIMEOUT_MS`),
+  con propagación RPC y reintentos internos; el tope duro del job es 90 s (`JOB_TIMEOUT_MS`). Un
+  timeout de 30 s en la app cortaría respuestas válidas. Muestra spinner con texto tipo
+  "Firmando en la red… puede tardar hasta un minuto y medio".
 - **`idempotency-key`**: genera un `UUID.randomUUID()` **por intento de usuario** (no por request
   HTTP) y reutilízalo en los reintentos automáticos de ese intento. Así, si la app pierde la
   respuesta por red, el reintento devuelve la misma respuesta (10 min de caché) en vez de
@@ -39,7 +41,7 @@ mensaje/UI con cuenta atrás).
 | 200 | — | `RaizResult.Success(txHash)` |
 | 409 | `ALREADY_RESIDENT` | **Éxito idempotente**: exactamente como hoy `SorobanClient.mintResident` trata `AlreadyResident (#5)`. No mostrar error. |
 | 409 | `MERCHANT_EXISTS` | El comercio ya está registrado; el relayer NO sobrescribe. Tratar como éxito si el address es el propio (ya eres comercio) o mostrar "este comercio ya existe". |
-| 404 | `ACCOUNT_NOT_FOUND` | La G… no existe en la red → llamar **friendbot primero** y reintentar (flujo de onboarding). `NOT_FOUND`. |
+| 404 | `ACCOUNT_NOT_FOUND` | La G… no existe en la red → llamar **friendbot primero** y reintentar (flujo de onboarding). Con una C…: la smart account **no está desplegada** → desplegarla primero (el faucet solo paga a contratos que existen). `NOT_FOUND`. |
 | 422 | `NO_TRUSTLINE` | La G… no tiene trustline USDC → **crear la trustline antes** (como hace hoy la app) y reintentar. `SIMULATION_FAILED` o un código nuevo `NO_TRUSTLINE` si se quiere UI específica. |
 | 422 | `TRUSTLINE_DEAUTHORIZED` | Raro en testnet. `UNAUTHORIZED`. |
 | 404 | `BARRIO_NOT_FOUND`, `BARRIO_ADMIN_NOT_SET` | Datos de barrio incoherentes con el deploy vigente (deployments.json desactualizado en assets). `NOT_FOUND`. |
@@ -69,6 +71,9 @@ Llamar al arrancar (o al entrar en el flujo admin) y cachear ~1 min:
   - `contracts.*` debe coincidir con el `deployments.json` de `assets/`; si no, avisar en log (deploy desfasado).
 - `ok == false` (503 `RPC_UNREACHABLE`) o error de red → mostrar el flujo admin como no disponible.
   No hay fallback local: el APK release ya no lleva la clave admin.
+- `/v1/health` corta la consulta a RPC/Horizon a los 8 s: la app puede usar un timeout corto
+  (~10 s) SOLO para esta llamada. Existe también `GET /v1/live` (`{ ok, uptimeSeconds }`, sin red):
+  es el liveness del proxy de Fly, **no** un feature-flag; la app no lo necesita.
 
 ## 4. Faucet: cómo llega el USDC
 
@@ -77,7 +82,9 @@ Llamar al arrancar (o al entrar en el flujo admin) y cachear ~1 min:
   (`HorizonStream`) lo muestra sin cambios.
 - Destino **C…** (smart account / passkey) → **SAC `transfer`** (`method: "sac_transfer"`).
   No sale en `/payments` de Horizon; se ve en los eventos del contrato SAC (como hoy con
-  `fundContractUsdc`).
+  `fundContractUsdc`). **Solo si la smart account ya está desplegada**: el relayer comprueba que
+  el contrato existe y, si no, responde `404 ACCOUNT_NOT_FOUND`. En el onboarding con passkey hay
+  que desplegar la smart account ANTES de pedir el faucet (una C… solo derivada no recibe nada).
 - Monto: `amountStroops` como string (`"200000000"` = 20 USDC, 7 decimales). Asset en `asset`.
 - Límite: 1 por address cada 10 min y 50/día global. La app **no** tiene guard "ya fondeado":
   gestiona el 429 con `retryAfterSeconds`.

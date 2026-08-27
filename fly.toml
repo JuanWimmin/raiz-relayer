@@ -32,12 +32,16 @@ kill_timeout = 120
   auto_start_machines = true
   min_machines_running = 1
 
+  # Liveness (/v1/live): "el proceso responde", sin tocar Stellar. NO apuntar a
+  # /v1/health: devuelve 503 cuando cae RPC/Horizon y el proxy sacaría al relayer
+  # justo cuando la app necesita leer ok:false para apagar el flujo admin.
+  # (/v1/health corta su ida al upstream a los 8 s, < grace/interval de aquí.)
   [[http_service.checks]]
     grace_period = "15s"
     interval = "30s"
     method = "GET"
     timeout = "5s"
-    path = "/v1/health"
+    path = "/v1/live"
 
 [[vm]]
   size = "shared-cpu-1x"

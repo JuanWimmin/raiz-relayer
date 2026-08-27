@@ -34,26 +34,41 @@ if [[ -z "$RELAYER_APP_KEY" ]]; then
 fi
 
 # Formatea JSON si hay jq; si no, lo imprime crudo.
+# Con `set -o pipefail`, un jq que recibe algo que NO es JSON (p. ej. el cuerpo
+# seguido de "HTTP 401") falla y tumba el script. Por eso `pretty` solo recibe
+# el cuerpo, y el código HTTP se imprime por separado (ver `call`).
 pretty() { if command -v jq >/dev/null 2>&1; then jq .; else cat; echo; fi; }
 
-# call MÉTODO RUTA [BODY]
+# call [--no-key] MÉTODO RUTA [BODY]
+#   El código HTTP va con -w a una variable y el cuerpo a un temporal, así jq
+#   nunca ve texto mezclado. `--no-key` omite x-raiz-app-key (rutas públicas y
+#   la prueba del 401).
 call() {
-    local method="$1" path="$2" body="${3:-}"
-    echo
-    echo "── $method $path"
-    [[ -n "$body" ]] && echo "   body: $body"
-    local tmp; tmp=$(mktemp)
-    local status
-    if [[ -n "$body" ]]; then
-        status=$(curl -sS -o "$tmp" -w '%{http_code}' -X "$method" "$RELAYER_URL$path" \
-            -H "content-type: application/json" \
-            -H "x-raiz-app-key: $RELAYER_APP_KEY" \
-            -H "idempotency-key: smoke-$(date +%s)-$RANDOM" \
-            --data "$body")
-    else
-        status=$(curl -sS -o "$tmp" -w '%{http_code}' -X "$method" "$RELAYER_URL$path" \
-            -H "x-raiz-app-key: $RELAYER_APP_KEY")
+    local with_key=1
+    if [[ "${1:-}" == "--no-key" ]]; then
+        with_key=0
+        shift
     fi
+    local method="$1" path="$2" body="${3:-}"
+    local label=""
+    if [[ "$with_key" -eq 0 ]]; then label=" (sin key)"; fi
+    echo
+    echo "── $method $path$label"
+    if [[ -n "$body" ]]; then echo "   body: $body"; fi
+
+    local tmp
+    tmp=$(mktemp)
+    local -a args=(-sS -o "$tmp" -w '%{http_code}' -X "$method" "$RELAYER_URL$path")
+    if [[ "$with_key" -eq 1 ]]; then
+        args+=(-H "x-raiz-app-key: $RELAYER_APP_KEY")
+    fi
+    if [[ -n "$body" ]]; then
+        args+=(-H "content-type: application/json" \
+               -H "idempotency-key: smoke-$(date +%s)-$RANDOM" \
+               --data "$body")
+    fi
+    local status
+    status=$(curl "${args[@]}")
     echo "   HTTP $status"
     pretty < "$tmp"
     rm -f "$tmp"
@@ -61,18 +76,16 @@ call() {
 
 echo "Relayer: $RELAYER_URL"
 
-# 1. Health (público, no necesita key)
-echo
-echo "── GET /v1/health (público)"
-curl -sS "$RELAYER_URL/v1/health" | pretty
+# 1. Liveness y health (públicos, no necesitan key).
+#    /v1/live → 200 siempre que el proceso responda (es lo que sondea Fly).
+#    /v1/health → 200 ok:true, o 503 RPC_UNREACHABLE si Stellar no responde.
+call --no-key GET /v1/live
+call --no-key GET /v1/health
 
 # 2. Auth: sin key → 401 UNAUTHORIZED_APP con envelope
-echo
-echo "── POST /v1/faucet SIN key (esperado 401 UNAUTHORIZED_APP)"
-curl -sS -w '\n   HTTP %{http_code}\n' -X POST "$RELAYER_URL/v1/faucet" \
-    -H "content-type: application/json" --data '{"address":"'"$SMOKE_ADDRESS"'"}' | pretty
+call --no-key POST /v1/faucet '{"address":"'"$SMOKE_ADDRESS"'"}'
 
-# 3. Ruta inexistente → 404 NOT_FOUND con envelope
+# 3. Ruta inexistente → 404 NOT_FOUND con envelope (también cuenta para el límite por IP)
 call GET /v1/no-existe
 
 # 4. Validación → 400 VALIDATION_ERROR (no consume cupo)

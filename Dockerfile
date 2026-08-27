@@ -40,8 +40,9 @@ USER node
 
 EXPOSE 8080
 
-# El health interno es público y cacheado (10 s): barato de sondear.
+# Liveness: /v1/live no toca la red (200 mientras el proceso responda). NO usar
+# /v1/health: da 503 cuando cae Stellar y el runtime reiniciaría un relayer sano.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD wget -qO- http://127.0.0.1:8080/v1/health || exit 1
+  CMD wget -qO- http://127.0.0.1:8080/v1/live || exit 1
 
 CMD ["node", "dist/index.js"]

@@ -30,11 +30,11 @@ Con el relayer:
 ## Arquitectura en 10 líneas
 
 1. **Node 22 + TypeScript ESM**, **Fastify 5**, **`@stellar/stellar-sdk` 17** (RPC + Horizon), zod, pino.
-2. `GET /v1/health` público; los `POST` exigen el header `x-raiz-app-key` (comparación en tiempo constante).
-3. Validación zod estricta de bodies (≤ 8 KB) → **preflights** (existencia de cuenta, trustline, `get_merchant`, balance del admin).
-4. **Rate-limits en memoria**: por IP (60/min), por address (faucet 1/10 min) y cupos diarios UTC por endpoint.
+2. `GET /v1/live` y `GET /v1/health` públicos; los `POST` exigen el header `x-raiz-app-key` (comparación en tiempo constante).
+3. Validación zod estricta de bodies (≤ 8 KB) → **preflights** (existencia de cuenta/contrato, trustline, `get_merchant`, balance del admin).
+4. **Rate-limits en memoria**: por IP (60/min, clave `Fly-Client-IP`), por address (faucet 1/10 min) y cupos diarios UTC por endpoint.
 5. **Cola serializada** (`SerialQueue`): una transacción a la vez porque hay **una** cuenta admin = **un** sequence number.
-6. Pipeline único `submit()`: simulate → assemble → sign → send → poll, con deadline de 75 s, reintentos ante propagación RPC y **política anti doble gasto** (máx. 1 rebuild, solo si la tx anterior es `NOT_FOUND` y su `maxTime` venció).
+6. Pipeline único `submit()`: simulate → assemble → sign → send → poll, con deadline de 70 s (y 15 s por request al RPC), reintentos ante propagación RPC y **política anti doble gasto** (máx. 1 rebuild, solo si la tx anterior es `NOT_FOUND` y su `maxTime` venció).
 7. **Allowlist de 6 contratos** (`pool, governance, treasury, rewards, yield_adapter, usdc_sac` de `config/deployments.testnet.json`); cualquier otro `contractId` se rechaza.
 8. Errores de contrato **atribuidos al contrato que falló** (eventos de diagnóstico), porque los códigos numéricos colisionan entre Pool, Governance, adapter y SAC.
 9. `idempotency-key` opcional → misma respuesta durante 10 min; peticiones concurrentes comparten la promesa.
@@ -47,7 +47,8 @@ Con el relayer:
 Base: `/v1`. Todos JSON (`content-type: application/json`), body ≤ 8 KB.
 
 **Auth:** header `x-raiz-app-key: <RELAYER_APP_KEY>` en todos los POST (401 si falta o no coincide).
-`GET /v1/health` es público (pero está bajo el limitador por IP).
+`GET /v1/live` y `GET /v1/health` son públicos (pero están bajo el limitador por IP, igual que
+las rutas inexistentes: un 404 también cuenta).
 
 **Idempotencia (opcional):** header `idempotency-key` (≤ 64 chars) → la misma respuesta durante
 10 min; misma key con body distinto → `422 IDEMPOTENCY_MISMATCH`; peticiones concurrentes con la
@@ -70,7 +71,7 @@ misma key esperan la misma promesa (no se firma dos veces).
 | 401 | `UNAUTHORIZED_APP` | falta/incorrecta `x-raiz-app-key` |
 | 404 | `BARRIO_NOT_FOUND` | Pool #6 |
 | 404 | `BARRIO_ADMIN_NOT_SET` | Governance #4 |
-| 404 | `ACCOUNT_NOT_FOUND` | faucet a G… sin crear (Horizon 404 / SAC #6) → "usa friendbot primero" |
+| 404 | `ACCOUNT_NOT_FOUND` | faucet a G… sin crear (Horizon 404 / SAC #6) → "usa friendbot primero"; faucet a C… cuyo contrato no está desplegado |
 | 404 | `NOT_FOUND` | ruta inexistente (o `/v1/vault/*` con `VAULT_ENDPOINTS_ENABLED=false`) |
 | 409 | `ALREADY_RESIDENT` | Governance #5 |
 | 409 | `MERCHANT_EXISTS` | preflight `get_merchant`: ya registrado, no se sobrescribe |
@@ -83,13 +84,23 @@ misma key esperan la misma promesa (no se firma dos veces).
 | 502 | `UNAUTHORIZED_ADMIN` | #3 en Pool/Governance/adapter: el relayer no es admin (mal configurado) |
 | 502 | `TX_FAILED` | tx aplicada con fallo; `details.txResult` |
 | 503 | `FAUCET_EMPTY` | balance USDC del admin < monto → [runbook](#runbook-re-fondear-el-faucet) |
-| 503 | `RPC_UNREACHABLE` | RPC/Horizon caídos |
+| 503 | `RPC_UNREACHABLE` | RPC/Horizon caídos o sin responder a tiempo (`/v1/health` corta a los 8 s; cada request al RPC a los `RPC_REQUEST_TIMEOUT_MS`) |
 | 503 | `QUEUE_FULL` | cola > `QUEUE_CAP` (20) |
 | 503 | `RESTORE_REQUIRED` | TTL vencido en entradas de Blend (vault) |
 | 503 | `TX_TIMEOUT` | deadline vencido con tx en vuelo; `details.txHash` — **puede aplicarse después** |
 | 500 | `INTERNAL` | error no clasificado |
 
 `retryable: true` solo en `RATE_LIMITED`, `RPC_UNREACHABLE`, `QUEUE_FULL`, `TX_TIMEOUT`, `RESTORE_REQUIRED`.
+
+### `GET /v1/live` (público, sin red)
+
+```jsonc
+200 { "ok": true, "uptimeSeconds": 123 }
+```
+
+**Liveness**: "el proceso responde". No consulta Stellar, no tiene caché y nunca devuelve 503.
+Es lo que sondean el `[[http_service.checks]]` de `fly.toml` y el `HEALTHCHECK` del Dockerfile.
+**No lo use la app** como feature-flag: no dice nada del estado de la red.
 
 ### `GET /v1/health` (público, cache 10 s)
 
@@ -102,7 +113,16 @@ misma key esperan la misma promesa (no se firma dos veces).
 503 { "ok": false, "error": { "code": "RPC_UNREACHABLE", … } }
 ```
 
-La app usa `ok` como feature-flag del relayer y `faucet.enabled` / `vaultEndpoints` para mostrar u ocultar botones.
+**Feature-flag** de la app: `ok` (relayer + Stellar operativos), `faucet.enabled` y
+`vaultEndpoints` para mostrar u ocultar botones. Devuelve **503 `RPC_UNREACHABLE` cuando RPC/Horizon
+fallan o tardan más de 8 s** (el error no se cachea; el siguiente GET reintenta). Por eso el proxy
+NO sondea esta ruta: una caída de Stellar debe verse como `ok:false`, no como "relayer muerto".
+
+| | `/v1/live` | `/v1/health` |
+|---|---|---|
+| Quién la usa | Fly / Docker (proceso vivo) | La app (feature-flag) |
+| Toca la red | No | Sí (RPC + Horizon, cache 10 s, tope 8 s) |
+| 503 posible | Nunca | Sí, cuando cae Stellar |
 
 ### `POST /v1/register-merchant` → `Pool.register_merchant(MerchantData)`
 
@@ -139,7 +159,10 @@ req  { "address": "G…|C…" }
 ```
 
 - `G…` → op **`payment` clásica** (aparece en Horizon `/payments`, que es lo que lee el historial de la app).
-- `C…` → **SAC `transfer(admin, C…, i128)`** sobre `usdc_sac`.
+- `C…` → **SAC `transfer(admin, C…, i128)`** sobre `usdc_sac`, **solo si la smart account está
+  desplegada** (el preflight comprueba que el contrato existe en la red; si no, `404
+  ACCOUNT_NOT_FOUND`). Una C… derivada pero aún no desplegada no recibe faucet: la app debe
+  desplegar la smart account primero.
 
 Cupo: 1 por address cada 10 min · 50/día global.
 
@@ -187,18 +210,23 @@ Opcionales (default entre paréntesis):
 | `RATE_REGISTER_DAILY` | `20` | Cupo diario de `register-merchant` |
 | `RATE_MINT_DAILY` | `20` | Cupo diario de `mint-resident` |
 | `RATE_VAULT_DAILY` | `20` | Cupo diario conjunto de `vault/*` |
-| `RATE_PER_IP_PER_MINUTE` | `60` | Limitador por IP (`trustProxy` para el `X-Forwarded-For` de Fly) |
+| `RATE_PER_IP_PER_MINUTE` | `60` | Limitador por IP. Clave = header `Fly-Client-IP` (lo escribe fly-proxy; **no** `X-Forwarded-For`, que el cliente puede rellenar), o la IP del socket si no viene. Cubre también los 404 |
 | `VAULT_ENDPOINTS_ENABLED` | `true` | `false` → `/v1/vault/*` responde 404 |
 | `LOG_LEVEL` | `info` | pino (`fatal…trace`, `silent`) |
 | `DEPLOYMENTS_FILE` | `config/deployments.testnet.json` | Copia literal del `deployments.json` del monorepo |
 | `QUEUE_CAP` | `20` | Jobs en espera antes de `503 QUEUE_FULL` |
-| `JOB_DEADLINE_MS` | `75000` | Deadline del pipeline por job (debe ser < `JOB_TIMEOUT_MS`) |
-| `JOB_TIMEOUT_MS` | `90000` | Timeout duro del job |
+| `JOB_DEADLINE_MS` | `70000` | Deadline del pipeline por job (simulate → poll) |
+| `RPC_REQUEST_TIMEOUT_MS` | `15000` | Timeout de **cada** request HTTP al RPC/Horizon (un upstream colgado no bloquea la cola) |
+| `JOB_TIMEOUT_MS` | `90000` | Timeout duro del job. Regla validada al arrancar: `JOB_TIMEOUT_MS >= JOB_DEADLINE_MS + RPC_REQUEST_TIMEOUT_MS + 5000` (el deadline puede vencer en mitad de una request al RPC que aún tarda hasta `RPC_REQUEST_TIMEOUT_MS`) |
 | `SUBMIT_ATTEMPTS` | `5` | Reintentos de `sendTransaction` ante `TRY_AGAIN_LATER` / red |
 | `SUBMIT_BACKOFF_MS` | `3000` | Espera entre reintentos |
 | `TX_TIMEOUT_SECONDS` | `30` | `maxTime` de la transacción |
 | `IDEMPOTENCY_TTL_MS` | `600000` | Vida de la caché de `idempotency-key` (10 min) |
-| `HEALTH_CACHE_MS` | `10000` | Caché de `/v1/health` |
+| `HEALTH_CACHE_MS` | `10000` | Caché de `/v1/health` (la ida a RPC/Horizon se corta a los 8 s, fijo) |
+
+Consecuencia para el cliente (sesión B): el **timeout HTTP de la app debe ser ≥ 95 s**
+(`JOB_DEADLINE_MS` 70 s + `RPC_REQUEST_TIMEOUT_MS` 15 s + margen), porque una respuesta válida
+puede tardar hasta `JOB_TIMEOUT_MS`. Ver [`docs/SESION_B_APP.md`](docs/SESION_B_APP.md).
 
 ---
 
@@ -271,13 +299,24 @@ nada y cupos diarios duplicados (los contadores son por proceso). `fly deploy` s
 crea dos máquinas por defecto. `fly.toml` fija `min_machines_running = 1`,
 `auto_stop_machines = "off"` y `kill_timeout = 120` para que el `SIGTERM` pueda drenar la cola.
 
+**Apagado ordenado:** ante `SIGTERM`, el proceso cierra el servidor HTTP y drena la cola con un
+**tope total de 100 s** para las dos fases (Fastify 5 espera a las respuestas en vuelo, y esas
+esperan a la cola, así que `app.close()` solo no bastaría como límite). Si al vencer quedan
+conexiones abiertas se cortan (`closeAllConnections`) antes de salir, siempre por debajo de los
+120 s de `kill_timeout`.
+
+**Health check del proxy:** `[[http_service.checks]]` apunta a **`/v1/live`** (proceso vivo, sin
+red), no a `/v1/health`. Si sondeara `/v1/health`, una caída de Stellar (503) haría que Fly
+sacara al relayer de servicio justo cuando la app necesita leer `ok:false` para desactivar el
+flujo admin. El `HEALTHCHECK` del Dockerfile sigue el mismo criterio.
+
 ---
 
 ## Límites y cupos
 
 | Recurso | Límite | Ámbito |
 |---|---|---|
-| Cualquier ruta | 60 req/min | por IP (`X-Forwarded-For` de Fly) |
+| Cualquier ruta (incluidos 404 y `/v1/live`) | 60 req/min | por IP (`Fly-Client-IP`; nunca `X-Forwarded-For`) |
 | `POST /v1/faucet` | 1 cada 10 min | por `address` |
 | `POST /v1/faucet` | 50/día (UTC) | global |
 | `POST /v1/register-merchant` | 20/día (UTC) | global |
@@ -313,6 +352,16 @@ mitigaciones de abuso, no autenticación.
   faucet y allowlist de contratos. **Lo que NO cubre:** que un tercero registre como comercio o
   residente una dirección ajena antes que su dueño, o vacíe el cupo diario de faucet/mint a
   propósito (denegación de servicio barata). En testnet el impacto es demo rota, no dinero.
+- **La ventana por address del faucet también protege a las `C…`.** Antes bastaba con derivar
+  direcciones de contrato (gratis, sin tocar la red) para rotar destinos y vaciar el cupo diario;
+  ahora el faucet a `C…` exige que el contrato **exista en la red** (`404 ACCOUNT_NOT_FOUND` si
+  no), y desplegar una smart account cuesta XLM y una transacción por dirección. Para `G…` la
+  barrera equivalente es friendbot (cuenta creada en la red).
+- **El limitador por IP no se evade con `X-Forwarded-For`.** La clave del cubo es el header
+  `Fly-Client-IP`, que escribe fly-proxy en cada request y el cliente no puede fijar desde fuera;
+  `trustProxy` es una función que solo confía en el proxy de Fly (`fdaa::/16`) y loopback, así que
+  `req.ip` (y el `remoteAddress` de los logs) tampoco se envenena rellenando `X-Forwarded-For`.
+  Los 404 pasan por el mismo cubo. Sigue siendo por IP: una NAT grande comparte los 60/min.
 - **La clave admin solo está en env** (`RELAYER_ADMIN_SECRET`); el proceso verifica que deriva a
   `deployments.admin`; pino redacta secret y headers; el `sim.error` crudo solo en `debug`.
 - **Sin CORS**: no se emiten cabeceras `Access-Control-*`, así que los navegadores bloquean el
@@ -374,7 +423,7 @@ respuesta del faucet puede tardar o fallar por rate-limit: reintenta pasados uno
 Verificación:
 
 ```bash
-curl -s "https://horizon-testnet.stellar.org/accounts/$ADDR" \
+curl -s "https://horizon-testnet.stellar.org/accounts/$ADMIN" \
   | jq '.balances[] | select(.asset_code=="USDC" and .asset_issuer=="GATALTGTWIOT6BUDBCZM3Q4OQ4BO2COLOAZ7IYSKPLC2PMSOPPGF5V56") | .balance'
 curl -s https://raiz-relayer.fly.dev/v1/health | jq .faucet     # enabled=true, adminUsdcStroops actualizado (cache 10 s)
 ```
@@ -389,11 +438,12 @@ Si el admin también anda corto de XLM (fees), `stellar keys fund raiz-admin --n
 Sin credenciales:
 
 ```bash
+curl -s https://raiz-relayer.fly.dev/v1/live   | jq .    # { ok: true, uptimeSeconds } — proceso vivo
 curl -s https://raiz-relayer.fly.dev/v1/health | jq .
 ```
 
-Debe devolver `ok: true`, `network: "testnet"`, `admin: "GBLS7PL5…"` y los contratos iguales a
-`config/deployments.testnet.json` (= `deployments.json` del monorepo).
+`/v1/health` debe devolver `ok: true`, `network: "testnet"`, `admin: "GBLS7PL5…"` y los contratos
+iguales a `config/deployments.testnet.json` (= `deployments.json` del monorepo).
 
 Con la API key (la del APK o una que te pase el equipo), un `POST` devuelve un `txHash`; se
 comprueba on-chain en Stellar Expert:
