@@ -37,7 +37,7 @@ Con el relayer:
 6. Pipeline único `submit()`: simulate → assemble → sign → send → poll, con deadline de 70 s (y 15 s por request al RPC), reintentos ante propagación RPC y **política anti doble gasto** (máx. 1 rebuild, solo si la tx anterior es `NOT_FOUND` y su `maxTime` venció).
 7. **Allowlist de 6 contratos** (`pool, governance, treasury, rewards, yield_adapter, usdc_sac` de `config/deployments.testnet.json`); cualquier otro `contractId` se rechaza.
 8. Errores de contrato **atribuidos al contrato que falló** (eventos de diagnóstico), porque los códigos numéricos colisionan entre Pool, Governance, adapter y SAC.
-9. `idempotency-key` opcional → misma respuesta durante 10 min; peticiones concurrentes comparten la promesa.
+9. `idempotency-key` opcional → misma respuesta durante 10 min; peticiones concurrentes comparten la promesa. Un `TX_TIMEOUT` con `txHash` también se cachea (reintentar con la misma key devuelve el mismo hash y **no re-firma**).
 10. Logs pino con `redact` (secret, `x-raiz-app-key`, `authorization`); `sim.error` crudo solo en `debug`.
 
 ---
@@ -53,6 +53,15 @@ las rutas inexistentes: un 404 también cuenta).
 **Idempotencia (opcional):** header `idempotency-key` (≤ 64 chars) → la misma respuesta durante
 10 min; misma key con body distinto → `422 IDEMPOTENCY_MISMATCH`; peticiones concurrentes con la
 misma key esperan la misma promesa (no se firma dos veces).
+
+Los errores **no** se cachean (un `RPC_UNREACHABLE`, `RATE_LIMITED`, etc. se puede reintentar con
+la misma key y vuelve a ejecutarse), con **una excepción**: `503 TX_TIMEOUT` con `details.txHash`
+**sí se cachea 10 min por `idempotency-key`**. Ese error significa que el envelope ya salió firmado
+y puede aplicarse todavía; reintentar con la misma key devuelve el **mismo** `TX_TIMEOUT` con el
+**mismo** `txHash` y **NO re-firma** (si re-firmara con secuencia nueva habría doble gasto, p. ej.
+dos `deposit_idle_to_vault`). La app debe esperar ~1 min y consultar/refrescar ese hash (RPC
+`getTransaction`), no repetir la operación. Un `TX_TIMEOUT` con `txHash: null` (la cola venció
+antes de enviar nada) no se cachea y sí es seguro reintentar.
 
 ### Envelope
 
@@ -87,7 +96,7 @@ misma key esperan la misma promesa (no se firma dos veces).
 | 503 | `RPC_UNREACHABLE` | RPC/Horizon caídos o sin responder a tiempo (`/v1/health` corta a los 8 s; cada request al RPC a los `RPC_REQUEST_TIMEOUT_MS`) |
 | 503 | `QUEUE_FULL` | cola > `QUEUE_CAP` (20) |
 | 503 | `RESTORE_REQUIRED` | TTL vencido en entradas de Blend (vault) |
-| 503 | `TX_TIMEOUT` | deadline vencido con tx en vuelo; `details.txHash` — **puede aplicarse después** |
+| 503 | `TX_TIMEOUT` | deadline vencido con tx en vuelo; `details.txHash` — **puede aplicarse después**. Con `txHash` se cachea 10 min por `idempotency-key`: reintentar con la misma key devuelve el mismo hash y no re-firma |
 | 500 | `INTERNAL` | error no clasificado |
 
 `retryable: true` solo en `RATE_LIMITED`, `RPC_UNREACHABLE`, `QUEUE_FULL`, `TX_TIMEOUT`, `RESTORE_REQUIRED`.

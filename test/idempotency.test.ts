@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { isRelayerError } from "../src/errors.js";
-import { IdempotencyCache, hashBody } from "../src/idempotency.js";
+import { RelayerError, isRelayerError } from "../src/errors.js";
+import { IdempotencyCache, hashBody, isCacheableFailure } from "../src/idempotency.js";
 
 /** Promesa que se resuelve desde fuera (para simular un job en vuelo). */
 function deferred<T>() {
@@ -91,6 +91,84 @@ describe("IdempotencyCache", () => {
       }),
     ).rejects.toThrow("sync");
     expect(cache.size()).toBe(0);
+  });
+
+  describe("TX_TIMEOUT con txHash (tx firmada en vuelo)", () => {
+    const TX_HASH = "cd".repeat(32);
+    const timeoutWithHash = () =>
+      new RelayerError("TX_TIMEOUT", "deadline vencido con tx en vuelo", { txHash: TX_HASH });
+
+    it("isCacheableFailure: solo TX_TIMEOUT con txHash string no vacío", () => {
+      expect(isCacheableFailure(timeoutWithHash())).toBe(true);
+      expect(isCacheableFailure(new RelayerError("TX_TIMEOUT", "sin hash", { txHash: null }))).toBe(false);
+      expect(isCacheableFailure(new RelayerError("TX_TIMEOUT", "sin details"))).toBe(false);
+      expect(isCacheableFailure(new RelayerError("TX_TIMEOUT", "hash vacío", { txHash: "" }))).toBe(false);
+      expect(isCacheableFailure(new RelayerError("RATE_LIMITED", "cupo", { txHash: TX_HASH }))).toBe(false);
+      expect(isCacheableFailure(new Error("boom"))).toBe(false);
+      expect(isCacheableFailure(undefined)).toBe(false);
+    });
+
+    it("SE cachea: el segundo run con la misma key no llama a fn y rechaza con el MISMO error", async () => {
+      const cache = new IdempotencyCache({ ttlMs: 60_000, now: () => 0 });
+      const h = hashBody({ barrioId: "11".repeat(32), amountStroops: "20000000" });
+      const err = timeoutWithHash();
+      const fn = vi.fn<() => Promise<string>>().mockRejectedValueOnce(err).mockResolvedValueOnce("re-firmada");
+
+      await expect(cache.run("vault-deposit", "k", h, fn)).rejects.toBe(err);
+      expect(cache.size()).toBe(1);
+
+      // Reintento con la misma key: no re-firma, devuelve el mismo hash.
+      await expect(cache.run("vault-deposit", "k", h, fn)).rejects.toSatisfy(
+        (e: unknown) => e === err && isRelayerError(e) && e.code === "TX_TIMEOUT" && e.details?.txHash === TX_HASH,
+      );
+      expect(fn).toHaveBeenCalledTimes(1);
+
+      // Misma key con body distinto sigue siendo mismatch, no el error cacheado.
+      await expect(cache.run("vault-deposit", "k", hashBody({ otro: 1 }), fn)).rejects.toSatisfy(
+        (e: unknown) => isRelayerError(e) && e.code === "IDEMPOTENCY_MISMATCH",
+      );
+      expect(fn).toHaveBeenCalledTimes(1);
+    });
+
+    it("el rechazo cacheado expira con la misma TTL que un éxito", async () => {
+      let t = 0;
+      const cache = new IdempotencyCache({ ttlMs: 1_000, now: () => t });
+      const h = hashBody({});
+      const fn = vi.fn<() => Promise<string>>().mockRejectedValueOnce(timeoutWithHash()).mockResolvedValueOnce("ok");
+      await expect(cache.run("s", "k", h, fn)).rejects.toSatisfy((e: unknown) => isRelayerError(e) && e.code === "TX_TIMEOUT");
+      t = 999;
+      await expect(cache.run("s", "k", h, fn)).rejects.toSatisfy((e: unknown) => isRelayerError(e) && e.code === "TX_TIMEOUT");
+      expect(fn).toHaveBeenCalledTimes(1);
+      t = 1_000;
+      await expect(cache.run("s", "k", h, fn)).resolves.toBe("ok");
+      expect(fn).toHaveBeenCalledTimes(2);
+    });
+
+    it("TX_TIMEOUT con txHash null NO se cachea: fn se llama de nuevo", async () => {
+      const cache = new IdempotencyCache({ ttlMs: 60_000, now: () => 0 });
+      const h = hashBody({});
+      const fn = vi
+        .fn<() => Promise<string>>()
+        .mockRejectedValueOnce(new RelayerError("TX_TIMEOUT", "la cola venció antes de enviar", { txHash: null }))
+        .mockResolvedValueOnce("ok");
+      await expect(cache.run("s", "k", h, fn)).rejects.toSatisfy((e: unknown) => isRelayerError(e) && e.code === "TX_TIMEOUT");
+      expect(cache.size()).toBe(0);
+      await expect(cache.run("s", "k", h, fn)).resolves.toBe("ok");
+      expect(fn).toHaveBeenCalledTimes(2);
+    });
+
+    it("otro RelayerError (RATE_LIMITED) NO se cachea aunque traiga txHash", async () => {
+      const cache = new IdempotencyCache({ ttlMs: 60_000, now: () => 0 });
+      const h = hashBody({});
+      const fn = vi
+        .fn<() => Promise<string>>()
+        .mockRejectedValueOnce(new RelayerError("RATE_LIMITED", "cupo agotado", { retryAfterSeconds: 5, txHash: TX_HASH }))
+        .mockResolvedValueOnce("ok");
+      await expect(cache.run("s", "k", h, fn)).rejects.toSatisfy((e: unknown) => isRelayerError(e) && e.code === "RATE_LIMITED");
+      expect(cache.size()).toBe(0);
+      await expect(cache.run("s", "k", h, fn)).resolves.toBe("ok");
+      expect(fn).toHaveBeenCalledTimes(2);
+    });
   });
 
   it("LRU por inserción: al superar max se expulsa la más antigua", async () => {

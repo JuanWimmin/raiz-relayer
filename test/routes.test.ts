@@ -619,4 +619,46 @@ describe("idempotencia", () => {
     expect((await post(app, "/v1/mint-resident", body, headers)).statusCode).toBe(200);
     expect(mintResident).toHaveBeenCalledTimes(2);
   });
+
+  it("TX_TIMEOUT con txHash SÍ se cachea: 2 POST /v1/faucet con la misma key → servicio 1 vez, ambos 503 con el mismo hash", async () => {
+    const IN_FLIGHT_HASH = "ef".repeat(32);
+    /* Como el servicio real: el submit ya salió (afterPreflight consumido) y
+     * el deadline venció con la tx en vuelo → TX_TIMEOUT con el hash. */
+    const faucet = vi.fn<StellarService["faucet"]>().mockImplementation(async (_input, hooks) => {
+      hooks?.afterPreflight?.();
+      throw new RelayerError("TX_TIMEOUT", "deadline vencido con tx en vuelo", { txHash: IN_FLIGHT_HASH });
+    });
+    const { app } = await makeApp(fakeService({ faucet }));
+    const headers = { "idempotency-key": "k-faucet-timeout" };
+
+    const r1 = await post(app, "/v1/faucet", { address: G_ADDR }, headers);
+    const r2 = await post(app, "/v1/faucet", { address: G_ADDR }, headers);
+
+    expect(r1.statusCode).toBe(503);
+    expect(r2.statusCode).toBe(503);
+    expect(r1.json()).toMatchObject({
+      ok: false,
+      error: { code: "TX_TIMEOUT", retryable: true, details: { txHash: IN_FLIGHT_HASH } },
+    });
+    expect(r2.json()).toEqual(r1.json());
+    /* No se re-firma: el reintento devuelve el hash en vuelo sin tocar el servicio. */
+    expect(faucet).toHaveBeenCalledTimes(1);
+  });
+
+  it("TX_TIMEOUT con txHash null (nada salió) NO se cachea: el reintento vuelve al servicio", async () => {
+    const faucet = vi
+      .fn<StellarService["faucet"]>()
+      .mockRejectedValueOnce(new RelayerError("TX_TIMEOUT", "la cola venció antes de enviar", { txHash: null }))
+      .mockImplementation(okWith(FAUCET_TX));
+    const { app } = await makeApp(fakeService({ faucet }));
+    const headers = { "idempotency-key": "k-faucet-timeout-null" };
+
+    const r1 = await post(app, "/v1/faucet", { address: G_ADDR }, headers);
+    expect(r1.statusCode).toBe(503);
+    expect(r1.json().error).toMatchObject({ code: "TX_TIMEOUT", details: { txHash: null } });
+
+    const r2 = await post(app, "/v1/faucet", { address: G_ADDR }, headers);
+    expect(r2.statusCode).toBe(200);
+    expect(faucet).toHaveBeenCalledTimes(2);
+  });
 });

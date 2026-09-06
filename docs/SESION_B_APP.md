@@ -20,6 +20,11 @@ endpoints está en el [README](../README.md); aquí solo va lo que afecta al có
   HTTP) y reutilízalo en los reintentos automáticos de ese intento. Así, si la app pierde la
   respuesta por red, el reintento devuelve la misma respuesta (10 min de caché) en vez de
   disparar una segunda transacción. Mismo key con body distinto → 422 `IDEMPOTENCY_MISMATCH`.
+  Los errores no se cachean (el reintento con la misma key vuelve a ejecutar), **salvo
+  `503 TX_TIMEOUT` con `details.txHash`**: ese se cachea 10 min por `idempotency-key`. Reintentar
+  con la misma key devuelve el **mismo** `TX_TIMEOUT` con el **mismo** hash y **NO re-firma** (la
+  tx ya salió y puede aplicarse; re-firmar sería doble gasto). Ante ese error la app debe esperar
+  ~1 min y refrescar/consultar el hash, no repetir la operación con una key nueva.
 - El faucet (`method`), mint y register devuelven `txHash` + `ledger`: guárdalos para la evidencia
   del SOW (`docs/evidencia_sow/d1/`).
 
@@ -56,7 +61,7 @@ mensaje/UI con cuenta atrás).
 | 503 | `FAUCET_EMPTY` | Sin USDC en el admin → mensaje "faucet agotado, avisa al equipo". `INSUFFICIENT_BALANCE`. |
 | 503 | `RPC_UNREACHABLE`, `QUEUE_FULL` | `NETWORK_ERROR`, reintentable. |
 | 503 | `RESTORE_REQUIRED` | TTL vencido en Blend (solo vault). `NETWORK_ERROR`, reintentable tras reseed. |
-| 503 | `TX_TIMEOUT` | Trae `details.txHash`: la tx **puede aplicarse después**. No repetir a ciegas: consultar el hash (RPC `getTransaction`) o reintentar con la MISMA `idempotency-key`. `NETWORK_ERROR`. |
+| 503 | `TX_TIMEOUT` | Trae `details.txHash`: la tx **puede aplicarse después**. Con `txHash` el relayer lo **cachea 10 min por `idempotency-key`**: reintentar con la MISMA key devuelve el mismo hash y NO re-firma. No repetir a ciegas ni con key nueva: esperar ~1 min y consultar el hash (RPC `getTransaction`) / refrescar balances. Si `txHash` es `null` no salió nada y sí es seguro reintentar. `NETWORK_ERROR`. |
 | 500 | `INTERNAL` | `UNKNOWN`. |
 | — | fallo de red / timeout Ktor | `NETWORK_ERROR`. |
 
