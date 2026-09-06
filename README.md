@@ -291,7 +291,7 @@ docker run --rm -p 8080:8080 -e NETWORK=testnet \
   -e RELAYER_APP_KEY="$RELAYER_APP_KEY" raiz-relayer
 ```
 
-Fly.io (región `bog`, `fly.toml` incluido):
+Fly.io (región `iad` — Ashburn; `bog` y `mia` están deprecadas en Fly y no admiten máquinas nuevas — `fly.toml` incluido):
 
 ```bash
 fly launch --no-deploy            # usa el fly.toml existente; no crees Postgres ni Redis

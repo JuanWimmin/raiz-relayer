@@ -11,7 +11,7 @@
 # Secretos (nunca aquí):  fly secrets set RELAYER_ADMIN_SECRET=… RELAYER_APP_KEY=…
 
 app = "raiz-relayer"
-primary_region = "bog"
+primary_region = "iad"  # bog (Bogotá) y mia (Miami) están deprecadas en Fly (2026); iad (Ashburn) es la región activa más cercana a Colombia
 # Margen para que SIGTERM drene la cola (un job puede tardar hasta JOB_TIMEOUT_MS = 90 s).
 kill_timeout = 120
 
