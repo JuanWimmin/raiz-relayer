@@ -1,0 +1,39 @@
+{
+  "ranAt": "2026-10-04T21:53:39.090Z",
+  "network": "testnet",
+  "admin": "GBLS7PL5Y65DHQIPMJO6HVQLX4FXEEHQDWHGSBUTGT4V6ZV2IOACYC2P",
+  "signer": "GB42NCO6VSK3ET32J5VHEPDH3GWLX5D5ADCIDQIHJFBY74LMHWMBRYL7",
+  "txs": {
+    "faucet_G_payment": {
+      "txHash": "5fff98784ebe1cd2b1a44ddc098d7b7761be5392b8c22a1ab39ee777c1777abf",
+      "ledger": 5025447,
+      "expert": "https://stellar.expert/explorer/testnet/tx/5fff98784ebe1cd2b1a44ddc098d7b7761be5392b8c22a1ab39ee777c1777abf"
+    },
+    "faucet_C_sac_transfer": {
+      "txHash": "ab63697de1623648512c2072e207a9a6e01d5c00eba8793c91d478739af35f18",
+      "ledger": 5025448,
+      "expert": "https://stellar.expert/explorer/testnet/tx/ab63697de1623648512c2072e207a9a6e01d5c00eba8793c91d478739af35f18"
+    },
+    "mint_resident": {
+      "txHash": "f584244713df7d6ec28d59f2cf11be143514db58f3b580334fbecd1039d4bd8d",
+      "ledger": 5025449,
+      "expert": "https://stellar.expert/explorer/testnet/tx/f584244713df7d6ec28d59f2cf11be143514db58f3b580334fbecd1039d4bd8d"
+    },
+    "register_merchant": {
+      "txHash": "684ba48f31aea7e59b0907969a032652ad4e213776cfe8d6d3892346c6837fec",
+      "ledger": 5025450,
+      "expert": "https://stellar.expert/explorer/testnet/tx/684ba48f31aea7e59b0907969a032652ad4e213776cfe8d6d3892346c6837fec"
+    }
+  },
+  "checks": {
+    "signerAuthority": "{\"status\":\"authorized\",\"weight\":1,\"required\":1}",
+    "health": "protocolVersion=29 adminUsdcStroops=11413000000 signerAuthorized=true",
+    "accountNotFound": "404 ACCOUNT_NOT_FOUND",
+    "noTrustline": "422 NO_TRUSTLINE",
+    "rateLimited": "429 retry-after=593",
+    "contractNotFound": "404 ACCOUNT_NOT_FOUND",
+    "alreadyResident": "409 ALREADY_RESIDENT",
+    "merchantExists": "409 MERCHANT_EXISTS",
+    "barrioAdminNotSet": "404 BARRIO_ADMIN_NOT_SET"
+  }
+}

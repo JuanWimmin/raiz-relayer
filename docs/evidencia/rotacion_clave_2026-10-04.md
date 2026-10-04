@@ -20,8 +20,9 @@ estuvo en un APK ni en un repositorio.
 | 4 | 21:15:42 | `set_options`: clave maestra a peso 0 y umbrales 1/1/1. Firma la clave **nueva** | tx [`1c56d1ca…35d7`](https://stellar.expert/explorer/testnet/tx/1c56d1ca0c10caaedfeeeccdbca49ce4587500fe76727e868b4c06b4a6b235d7), ledger 5024991 |
 | 5 | 21:16 | Una transacción firmada con la clave vieja es rechazada | `stellar tx new bump-sequence --source-account raiz-admin …` → `transaction submission failed: TxBadAuth` |
 | 6 | 21:16 | El relayer sigue firmando tras el cambio | faucet tx [`8c868f29…0bca`](https://stellar.expert/explorer/testnet/tx/8c868f2917dba386738f9f4901f46c12e203e87d704b92230d0eee07f2d00bca), ledger 5024999 |
+| 7 | 21:53 | Suite de integración completa contra testnet (`RELAYER_IT=1`, 11 pruebas) con la clave nueva: faucet a `G…` y a `C…`, `mint_resident`, `register_merchant` y los rechazos esperados (404, 409, 422, 429) | [`it-testnet-2026-10-04.json`](it-testnet-2026-10-04.json): [`5fff9878…7abf`](https://stellar.expert/explorer/testnet/tx/5fff98784ebe1cd2b1a44ddc098d7b7761be5392b8c22a1ab39ee777c1777abf) · [`ab63697d…5f18`](https://stellar.expert/explorer/testnet/tx/ab63697de1623648512c2072e207a9a6e01d5c00eba8793c91d478739af35f18) · [`f5842447…bd8d`](https://stellar.expert/explorer/testnet/tx/f584244713df7d6ec28d59f2cf11be143514db58f3b580334fbecd1039d4bd8d) · [`684ba48f…7fec`](https://stellar.expert/explorer/testnet/tx/684ba48f31aea7e59b0907969a032652ad4e213776cfe8d6d3892346c6837fec) |
 
-En los pasos 3 y 6 la cuenta de origen de cada transacción es la cuenta admin y la única firma del
+En los pasos 3, 6 y 7 la cuenta de origen de cada transacción es la cuenta admin y la única firma del
 sobre lleva la pista (`hint`) de la clave nueva (`6c3d9818`), no la de la maestra (`ba43802c`).
 
 Estado de la cuenta después (Horizon, `/accounts/GBLS7PL5…`):
@@ -44,5 +45,9 @@ Notas:
   mantiene el servicio. Si se perdiera, no habría forma de firmar por la cuenta admin.
 - La rotación corta el acceso de aquí en adelante; no deshace lo que se hubiera firmado con la clave
   vieja mientras fue válida. El historial de la cuenta es público.
+- La suite del paso 7 deja datos de prueba en el barrio Centro Histórico: un comercio "Cafe IT Relayer"
+  (`GCZHSAHE…SUOM`) y un residente (`GC4C557V…FEZS`). Sus entradas de ledger se renovaron a
+  +1 500 000 ledgers (tx `acd2b698…cdb9` y `2a9f6022…8a84`) para que las lecturas del barrio sigan
+  siendo puras.
 - Sigue habiendo un solo firmante. El paso a multisig está preparado en el monorepo
   (`scripts/setup_admin_multisig.sh`).
