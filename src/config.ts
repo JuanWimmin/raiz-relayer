@@ -2,11 +2,20 @@
  * Configuración del relayer: variables de entorno + deployments.json.
  *
  * Reglas duras (el proceso NO arranca si fallan):
- *  - RELAYER_ADMIN_SECRET presente y válido (S…), y su clave pública debe
- *    coincidir con `admin` de deployments.json (un secret equivocado no firma
- *    nada por error).
+ *  - RELAYER_ADMIN_SECRET presente y válido (S…).
  *  - NETWORK === "testnet". Este servicio no está pensado para mainnet.
  *  - RELAYER_APP_KEY de al menos 16 caracteres.
+ *
+ * Cuenta admin ≠ clave que firma. Son dos claves públicas con dos papeles:
+ *  - `adminPublicKey`  = `admin` de deployments.json: la CUENTA. Es el origen
+ *    de las transacciones, lo que se consulta en Horizon/RPC y el admin que
+ *    guardan los contratos. No cambia aunque se rote la clave.
+ *  - `signerPublicKey` = la que deriva de RELAYER_ADMIN_SECRET: QUIÉN firma.
+ *    Puede ser la maestra de la cuenta admin o un firmante autorizado de ella
+ *    (tras una rotación la maestra queda con peso 0 y firma un firmante).
+ * Por eso aquí ya no se exige que el secret derive a `deployments.admin`. Que
+ * la clave PUEDE firmar por la cuenta no se deduce del secret: está en el
+ * ledger, y se comprueba al arrancar (src/stellar/signer.ts, desde index.ts).
  *
  * El secret nunca sale de este módulo como string: `loadConfig()` devuelve el
  * Keypair aparte del objeto `Config` (que sí puede loguearse).
@@ -40,7 +49,10 @@ const envSchema = z.object({
     error: "NETWORK debe ser exactamente 'testnet' (este relayer no soporta mainnet).",
   }),
   RELAYER_ADMIN_SECRET: z
-    .string({ error: "Falta RELAYER_ADMIN_SECRET (clave S… del admin del protocolo)." })
+    .string({
+      error:
+        "Falta RELAYER_ADMIN_SECRET (clave S… con la que firma el relayer: la maestra de la cuenta admin o un firmante autorizado de ella).",
+    })
     .refine((s) => StrKey.isValidEd25519SecretSeed(s), {
       message: "RELAYER_ADMIN_SECRET no es una seed ed25519 válida (S…).",
     }),
@@ -111,8 +123,10 @@ export interface Config {
   horizonUrl: string;
   port: number;
   host: string;
-  /** Clave pública del admin (= deployments.admin). */
+  /** La CUENTA admin (= deployments.admin): origen de las transacciones y admin de los contratos. */
   adminPublicKey: string;
+  /** Clave pública que deriva de RELAYER_ADMIN_SECRET: la que FIRMA (la maestra de la cuenta admin o un firmante suyo). */
+  signerPublicKey: string;
   appKey: string;
   faucetAmountStroops: bigint;
   usdcIssuer: string;
@@ -166,20 +180,16 @@ export function loadDeployments(path: string): Deployments {
  * Carga y valida la configuración. Lanza ConfigError con mensaje claro; el
  * bootstrap lo imprime y sale con código 1.
  */
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): { config: Config; adminKeypair: Keypair } {
+export function loadConfig(env: NodeJS.ProcessEnv = process.env): { config: Config; signerKeypair: Keypair } {
   const parsed = envSchema.safeParse(env);
   if (!parsed.success) throw new ConfigError(formatZodError("Configuración inválida:", parsed.error));
   const e = parsed.data;
 
   const deployments = loadDeployments(e.DEPLOYMENTS_FILE);
 
-  const adminKeypair = Keypair.fromSecret(e.RELAYER_ADMIN_SECRET);
-  if (adminKeypair.publicKey() !== deployments.admin) {
-    throw new ConfigError(
-      `RELAYER_ADMIN_SECRET deriva a ${adminKeypair.publicKey()} pero deployments.admin es ${deployments.admin}. ` +
-        "El relayer solo firma con la cuenta admin del despliegue vigente.",
-    );
-  }
+  // La clave que firma. NO tiene por qué derivar a deployments.admin (puede ser
+  // un firmante de esa cuenta); su autoridad se verifica on-chain al arrancar.
+  const signerKeypair = Keypair.fromSecret(e.RELAYER_ADMIN_SECRET);
 
   const contracts: Record<InvokableRole, string> = {
     pool: deployments.pool,
@@ -201,7 +211,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): { config: Conf
     horizonUrl: e.HORIZON_URL,
     port: e.PORT,
     host: e.HOST,
-    adminPublicKey: adminKeypair.publicKey(),
+    adminPublicKey: deployments.admin,
+    signerPublicKey: signerKeypair.publicKey(),
     appKey: e.RELAYER_APP_KEY,
     faucetAmountStroops: BigInt(e.FAUCET_AMOUNT_STROOPS),
     usdcIssuer: deployments.usdc_issuer,
@@ -241,7 +252,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): { config: Conf
         `(= ${config.jobDeadlineMs} + ${config.rpcRequestTimeoutMs} + ${JOB_TIMEOUT_MARGIN_MS} = ${minJobTimeoutMs}).`,
     );
   }
-  return { config, adminKeypair };
+  return { config, signerKeypair };
 }
 
 /** Versión segura para logs (sin appKey; URLs reducidas al origen por si llevan credenciales o tokens en el path). */

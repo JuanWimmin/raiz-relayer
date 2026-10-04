@@ -5,9 +5,9 @@
  * pipeline y un solo deadline por job (`config.jobDeadlineMs`):
  *
  *   (a) allowlist   → solo contratos de `config.contracts`
- *   (b) getAccount  → secuencia fresca (con reintentos de red)
+ *   (b) getAccount  → secuencia fresca de la CUENTA admin (con reintentos de red)
  *   (c) simulate    → atribución de Error(Contract, #N) al contrato que falló
- *   (d) sign + hash
+ *   (d) sign + hash → firma la clave del relayer (la maestra o un firmante de la cuenta)
  *   (e) send        → PENDING/DUPLICATE: poll · TRY_AGAIN_LATER/red: REENVIAR
  *                      EL MISMO ENVELOPE · ERROR: mapear o rebuild
  *   (f) poll        → SUCCESS / FAILED / NOT_FOUND (expirada → rebuild)
@@ -35,16 +35,18 @@
  * Nunca se loguea XDR completo ni `sim.error` por encima de nivel debug: el
  * texto del host puede ser largo y no es para el cliente.
  */
-import { rpc as sdkRpc, type Account, type Keypair, type Transaction } from "@stellar/stellar-sdk";
+import { rpc as sdkRpc, type Account, type Keypair, type Transaction, type xdr } from "@stellar/stellar-sdk";
 import type { Config } from "../config.js";
 import {
   REBUILDABLE_TX_CODES,
   RelayerError,
+  mapBadAuthResult,
   mapContractError,
   mapPaymentOpResult,
   parseContractError,
   paymentOpResultName,
   txResultCodeName,
+  type ErrorDetails,
   type SimulationErrorLike,
 } from "../errors.js";
 import type { Logger } from "../logger.js";
@@ -61,6 +63,11 @@ export interface RpcLike {
 
 export interface SubmitDeps {
   rpc: RpcLike;
+  /**
+   * Clave que FIRMA el sobre (`config.signerPublicKey`): la maestra de la
+   * cuenta admin o un firmante autorizado de ella. El ORIGEN de la transacción
+   * es siempre la cuenta (`config.adminPublicKey`), no esta clave.
+   */
   keypair: Keypair;
   config: Config;
   logger: Logger;
@@ -358,6 +365,9 @@ async function sendAndPoll(ctx: Ctx, built: Built): Promise<Outcome> {
       );
       break;
     }
+    // Firma rechazada: reconstruir no lo arregla y el cliente no debe reintentar.
+    const badAuth = sent.errorResult && signerRejected(ctx, sent.errorResult, { stage: "send", txHash: built.hash });
+    if (badAuth) throw badAuth;
     if (isClassic && name === "txFailed" && sent.errorResult) {
       throw mapPaymentOpResult(paymentOpResultName(sent.errorResult) ?? "txFailed", name);
     }
@@ -403,6 +413,8 @@ async function sendAndPoll(ctx: Ctx, built: Built): Promise<Outcome> {
         logger.warn({ label: ctx.label, txHash: built.hash, ledger: got.ledger, txResult: name }, "poll: FAILED");
         // Aplicada con fallo: definitivo, así que reconstruir es seguro.
         if (REBUILDABLE_TX_CODES.has(name)) return { kind: "rebuild", txResult: name, accepted: true };
+        const badAuth = signerRejected(ctx, got.resultXdr, { txHash: built.hash, ledger: got.ledger });
+        if (badAuth) throw badAuth;
         if (isClassic && name === "txFailed") {
           throw mapPaymentOpResult(paymentOpResultName(got.resultXdr) ?? "txFailed", name);
         }
@@ -433,6 +445,25 @@ async function sendAndPoll(ctx: Ctx, built: Built): Promise<Outcome> {
       "poll: estado desconocido",
     );
   }
+}
+
+/**
+ * Si el resultado es un rechazo de la FIRMA del sobre (`txBadAuth`, o
+ * `txFailed` con `opBadAuth`), lo deja en el log con las dos claves públicas
+ * —cuenta y firmante— y devuelve el error no reintentable; undefined si el
+ * fallo es otro. Pasa cuando la clave del relayer ya no es un firmante válido
+ * de la cuenta admin (rotada, peso 0 o por debajo del umbral).
+ */
+function signerRejected(ctx: Ctx, result: xdr.TransactionResult, details: ErrorDetails): RelayerError | undefined {
+  const { config, logger } = ctx.deps;
+  const err = mapBadAuthResult(result, { admin: config.adminPublicKey, signer: config.signerPublicKey, ...details });
+  if (err) {
+    logger.error(
+      { label: ctx.label, ...err.details },
+      "submit: la red rechazó la firma del relayer; su clave no está autorizada en la cuenta admin",
+    );
+  }
+  return err;
 }
 
 /**

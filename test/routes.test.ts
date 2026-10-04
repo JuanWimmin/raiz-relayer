@@ -9,12 +9,15 @@ import { loadConfig } from "../src/config.js";
 import { RelayerError } from "../src/errors.js";
 import { createLogger } from "../src/logger.js";
 import { HEALTH_UPSTREAM_TIMEOUT_MS } from "../src/routes/health.js";
-import type { FaucetResult, ServiceHooks, StellarService, SubmitResult } from "../src/types.js";
+import type { FaucetResult, HealthSnapshot, ServiceHooks, StellarService, SubmitResult } from "../src/types.js";
 
 // ─── Config de test: admin aleatorio + deployments temporal ──────────────────
+// `admin` es la CUENTA (deployments.admin); el relayer firma con otra clave
+// (`signer`), como tras una rotación.
 
 const TEST_KEY = "test-key-0123456789abcdef";
 const admin = Keypair.random();
+const signer = Keypair.random();
 
 const baseDeployments = JSON.parse(
   readFileSync(new URL("../config/deployments.testnet.json", import.meta.url), "utf8"),
@@ -26,7 +29,7 @@ writeFileSync(deploymentsFile, JSON.stringify({ ...baseDeployments, admin: admin
 function testEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   return {
     NETWORK: "testnet",
-    RELAYER_ADMIN_SECRET: admin.secret(),
+    RELAYER_ADMIN_SECRET: signer.secret(),
     RELAYER_APP_KEY: TEST_KEY,
     DEPLOYMENTS_FILE: deploymentsFile,
     RATE_PER_IP_PER_MINUTE: "100000",
@@ -44,6 +47,11 @@ const FAUCET_TX: FaucetResult = {
   method: "payment",
 };
 
+/** Lectura de salud "todo OK" (firmante verificado); cada test cambia lo que le interesa. */
+function healthSnap(overrides: Partial<HealthSnapshot> = {}): HealthSnapshot {
+  return { protocolVersion: 28, latestLedger: 100, adminUsdcStroops: "3412750000", signerAuthorized: true, ...overrides };
+}
+
 /** Implementación "todo OK" que invoca afterPreflight como haría el servicio real. */
 function okWith<T>(value: T) {
   return async (_input: unknown, hooks?: ServiceHooks): Promise<T> => {
@@ -59,7 +67,7 @@ function fakeService(overrides: Partial<StellarService> = {}): StellarService {
     faucet: vi.fn(okWith(FAUCET_TX)),
     vaultDeposit: vi.fn(okWith(TX)),
     vaultRedeem: vi.fn(okWith(TX)),
-    health: vi.fn(async () => ({ protocolVersion: 28, latestLedger: 100, adminUsdcStroops: "3412750000" })),
+    health: vi.fn(async () => healthSnap()),
     queuePending: vi.fn(() => 0),
     ...overrides,
   };
@@ -100,7 +108,11 @@ describe("GET /v1/health", () => {
     expect(body.ok).toBe(true);
     expect(body.network).toBe("testnet");
     expect(body.protocolVersion).toBe(28);
+    // `admin` sigue siendo la CUENTA; `signer` es la clave pública con la que firma el relayer.
     expect(body.admin).toBe(admin.publicKey());
+    expect(body.signer).toBe(signer.publicKey());
+    expect(body.signer).not.toBe(body.admin);
+    expect(body.signerAuthorized).toBe(true);
     expect(body.contracts).toEqual({
       pool: baseDeployments["pool"],
       governance: baseDeployments["governance"],
@@ -130,18 +142,62 @@ describe("GET /v1/health", () => {
 
   it("faucet.enabled=false cuando el admin tiene menos USDC que el monto", async () => {
     const service = fakeService({
-      health: vi.fn(async () => ({ protocolVersion: 28, latestLedger: 1, adminUsdcStroops: "199999999" })),
+      health: vi.fn(async () => healthSnap({ adminUsdcStroops: "199999999" })),
     });
     const { app } = await makeApp(service);
     const res = await app.inject({ method: "GET", url: "/v1/health" });
     expect(res.json().faucet.enabled).toBe(false);
   });
 
+  it("signerAuthorized refleja lo que diga el servicio: false (firmante sin autoridad) y null (sin verificar), con el JSON `null` explícito", async () => {
+    for (const state of [false, null]) {
+      const service = fakeService({ health: vi.fn(async () => healthSnap({ signerAuthorized: state })) });
+      const { app } = await makeApp(service);
+      const res = await app.inject({ method: "GET", url: "/v1/health" });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+      expect(body.signerAuthorized).toBe(state);
+      expect(res.body).toContain(`"signerAuthorized":${String(state)}`);
+      // El resto del contrato no cambia: el feature-flag de la app sigue igual.
+      expect(body.ok).toBe(true);
+      expect(body.admin).toBe(admin.publicKey());
+      expect(body.signer).toBe(signer.publicKey());
+    }
+  });
+
+  it("conserva TODOS los campos que parsea la app (RelayerHealth); `signer` y `signerAuthorized` solo se añaden", async () => {
+    const { app } = await makeApp();
+    const body = (await app.inject({ method: "GET", url: "/v1/health" })).json();
+    expect(Object.keys(body).sort()).toEqual(
+      [
+        // Los que la app exige (kotlinx.serialization los marca obligatorios)…
+        "ok",
+        "network",
+        "protocolVersion",
+        "admin",
+        "contracts",
+        "faucet",
+        "limits",
+        "vaultEndpoints",
+        "version",
+        "uptimeSeconds",
+        // …el opcional…
+        "queue",
+        // …y los nuevos (la app ignora claves desconocidas).
+        "signer",
+        "signerAuthorized",
+      ].sort(),
+    );
+    // `version` sale del package.json (no hay otra fuente que se pueda desfasar).
+    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
+    expect(body.version).toBe(pkg.version);
+  });
+
   it("503 RPC_UNREACHABLE si service.health() lanza, y no se cachea", async () => {
     const health = vi
       .fn<StellarService["health"]>()
       .mockRejectedValueOnce(new RelayerError("RPC_UNREACHABLE", "RPC caído"))
-      .mockResolvedValueOnce({ protocolVersion: 28, latestLedger: 1, adminUsdcStroops: "0" });
+      .mockResolvedValueOnce(healthSnap({ latestLedger: 1, adminUsdcStroops: "0" }));
     const { app } = await makeApp(fakeService({ health }));
 
     const bad = await app.inject({ method: "GET", url: "/v1/health" });
@@ -178,7 +234,7 @@ describe("GET /v1/health", () => {
               hung += 1; // nunca resuelve: simula un RPC que acepta el socket y no contesta
             }),
         )
-        .mockResolvedValueOnce({ protocolVersion: 28, latestLedger: 1, adminUsdcStroops: "0" });
+        .mockResolvedValueOnce(healthSnap({ latestLedger: 1, adminUsdcStroops: "0" }));
       const { app } = await makeApp(fakeService({ health }));
 
       const pending = app.inject({ method: "GET", url: "/v1/health" });

@@ -49,27 +49,42 @@ import {
   stroopsToDecimal,
 } from "./encode.js";
 import { adminUsdcBalanceStroops, contractExists, loadHorizonAccount, merchantExists, networkInfo } from "./reads.js";
+import { verifySignerAuthority } from "./signer.js";
 import { submitTransaction, type SubmitDeps, type SubmitSpec } from "./submit.js";
 
 export interface StellarServiceDeps {
   config: Config;
-  adminKeypair: Keypair;
+  /** Clave que firma (la de RELAYER_ADMIN_SECRET): la maestra de la cuenta admin o un firmante suyo. */
+  signerKeypair: Keypair;
   logger: Logger;
   clients?: Clients;
   queue?: SerialQueue;
+  /**
+   * Resultado de la verificación del firmante en el arranque: `true`, o `null`
+   * si Horizon no respondió ("no verificado"). Con `unauthorized` el proceso no
+   * llega a crear el servicio. Por defecto `null`.
+   */
+  signerAuthorized?: boolean | null;
 }
 
 const SOROBAN_FEE = "500000";
 const CLASSIC_FEE = "1000";
 
 export function createStellarService(deps: StellarServiceDeps): StellarService {
-  const { config, adminKeypair, logger } = deps;
+  const { config, signerKeypair, logger } = deps;
   const clients = deps.clients ?? createClients(config);
   const queue = deps.queue ?? new SerialQueue({ cap: config.queueCap, jobTimeoutMs: config.jobTimeoutMs, logger });
+  // La CUENTA admin: origen de las transacciones y argumento `admin` de los
+  // contratos. Quien firma es `signerKeypair`, que puede ser otra clave.
   const admin = config.adminPublicKey;
   const usdcAsset = new Asset("USDC", config.usdcIssuer);
 
-  const submitDeps: SubmitDeps = { rpc: clients.rpc, keypair: adminKeypair, config, logger };
+  const submitDeps: SubmitDeps = { rpc: clients.rpc, keypair: signerKeypair, config, logger };
+
+  // ¿El firmante puede firmar por la cuenta admin? Último resultado
+  // VERIFICADO: parte del que deja el arranque y lo refresca cada lectura de
+  // salud. null = todavía no se pudo comprobar.
+  let signerAuthorized: boolean | null = deps.signerAuthorized ?? null;
 
   const sorobanBuild =
     (contractId: string, method: string, args: xdr.ScVal[]) =>
@@ -211,11 +226,36 @@ export function createStellarService(deps: StellarServiceDeps): StellarService {
     },
 
     async health(): Promise<HealthSnapshot> {
-      const [net, adminUsdc] = await Promise.all([
+      const [net, adminUsdc, authority] = await Promise.all([
         networkInfo(clients.rpc, logger),
         adminUsdcBalanceStroops(clients.horizon, config, logger),
+        // Un solo intento y nunca lanza: es una lectura aparte de la cuenta
+        // admin para que un fallo suyo no tumbe el health (solo deja el estado
+        // como estaba).
+        verifySignerAuthority(clients.horizon, config, { attempts: 1, logger }),
       ]);
-      return { protocolVersion: net.protocolVersion, latestLedger: net.latestLedger, adminUsdcStroops: adminUsdc.toString() };
+      // Los firmantes de la cuenta pueden cambiar con el relayer en marcha
+      // (rotación de clave): el estado sigue al ledger. `unknown` no lo toca.
+      if (authority.status === "authorized") {
+        if (signerAuthorized !== true) {
+          logger.info(
+            { admin, signer: config.signerPublicKey, weight: authority.weight, required: authority.required },
+            "firmante verificado: puede firmar por la cuenta admin",
+          );
+        }
+        signerAuthorized = true;
+      } else if (authority.status === "unauthorized") {
+        if (signerAuthorized !== false) {
+          logger.error({ admin, signer: config.signerPublicKey, reason: authority.reason }, authority.message);
+        }
+        signerAuthorized = false;
+      }
+      return {
+        protocolVersion: net.protocolVersion,
+        latestLedger: net.latestLedger,
+        adminUsdcStroops: adminUsdc.toString(),
+        signerAuthorized,
+      };
     },
 
     queuePending(): number {

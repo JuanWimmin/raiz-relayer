@@ -1,9 +1,10 @@
 /**
  * Integración REAL contra Stellar testnet. Solo corre con RELAYER_IT=1 y una
- * configuración válida en el entorno (RELAYER_ADMIN_SECRET del admin vigente,
- * RELAYER_APP_KEY, NETWORK=testnet):
+ * configuración válida en el entorno (RELAYER_ADMIN_SECRET = la clave con la
+ * que firma el relayer, un firmante vigente de la cuenta admin; la cuenta
+ * sigue siendo `deployments.admin`; RELAYER_APP_KEY, NETWORK=testnet):
  *
- *   RELAYER_IT=1 RELAYER_ADMIN_SECRET=$(stellar keys show raiz-admin) \
+ *   RELAYER_IT=1 RELAYER_ADMIN_SECRET=$(stellar keys show raiz-admin-signer) \
  *   RELAYER_APP_KEY=test-key-0123456789abcdef npx vitest run test/integration
  *
  * Mueve USDC de verdad (de testnet) desde la cuenta admin: 1 faucet de 20 USDC
@@ -32,6 +33,7 @@ import { buildApp } from "../../src/app.js";
 import { loadConfig, type Config } from "../../src/config.js";
 import { createLogger } from "../../src/logger.js";
 import { createStellarService } from "../../src/stellar/service.js";
+import { verifySignerAuthority } from "../../src/stellar/signer.js";
 
 const IT = process.env.RELAYER_IT === "1";
 const describeIt = IT ? describe : describe.skip;
@@ -50,7 +52,10 @@ const itWithSmartAccount = SMART_ACCOUNT ? it : it.skip;
 interface Evidence {
   ranAt: string;
   network: string;
+  /** La cuenta admin (origen de las transacciones). */
   admin: string;
+  /** La clave pública con la que firmó el relayer (la maestra o un firmante de la cuenta). */
+  signer: string;
   txs: Record<string, { txHash: string; ledger: number; expert: string }>;
   checks: Record<string, string>;
 }
@@ -60,7 +65,7 @@ describeIt("relayer contra testnet (RELAYER_IT=1)", () => {
   let config: Config;
   let horizon: Horizon.Server;
   const appKey = process.env.RELAYER_APP_KEY ?? "";
-  const evidence: Evidence = { ranAt: new Date().toISOString(), network: "testnet", admin: "", txs: {}, checks: {} };
+  const evidence: Evidence = { ranAt: new Date().toISOString(), network: "testnet", admin: "", signer: "", txs: {}, checks: {} };
 
   // Cuentas de prueba frescas (no se persisten: cada run usa unas nuevas).
   const residentKp = Keypair.random(); // G… que recibe faucet + soulbound
@@ -79,8 +84,9 @@ describeIt("relayer contra testnet (RELAYER_IT=1)", () => {
     const loaded = loadConfig(process.env);
     config = loaded.config;
     evidence.admin = config.adminPublicKey;
+    evidence.signer = config.signerPublicKey;
     const logger = createLogger(process.env.LOG_LEVEL ?? "warn");
-    const service = createStellarService({ config, adminKeypair: loaded.adminKeypair, logger });
+    const service = createStellarService({ config, signerKeypair: loaded.signerKeypair, logger });
     app = await buildApp({ config, service, logger });
     horizon = new Horizon.Server(config.horizonUrl);
 
@@ -97,16 +103,28 @@ describeIt("relayer contra testnet (RELAYER_IT=1)", () => {
     console.log(`\n[IT] evidencia escrita en ${out}\n${JSON.stringify(evidence, null, 2)}`);
   });
 
+  it("la clave configurada puede firmar por la cuenta admin (misma verificación on-chain que hace el arranque)", async () => {
+    // Contra el Horizon real: si esto falla, todo lo demás daría 502 UNAUTHORIZED_ADMIN.
+    const authority = await verifySignerAuthority(horizon, config);
+    expect(authority, JSON.stringify(authority)).toMatchObject({ status: "authorized" });
+    evidence.checks.signerAuthority = JSON.stringify(authority);
+  });
+
   it("GET /v1/health responde 200 con los contratos del deploy vigente", async () => {
     const res = await app.inject({ method: "GET", url: "/v1/health" });
     expect(res.statusCode).toBe(200);
     const body = res.json();
     expect(body.ok).toBe(true);
     expect(body.network).toBe("testnet");
+    expect(body.admin).toBe(config.adminPublicKey);
+    expect(body.signer).toBe(config.signerPublicKey);
+    expect(body.signerAuthorized).toBe(true);
     expect(body.contracts.pool).toBe(config.contracts.pool);
     expect(body.contracts.usdc_sac).toBe(config.contracts.usdc_sac);
     expect(body.faucet.enabled).toBe(true);
-    evidence.checks.health = `protocolVersion=${body.protocolVersion} adminUsdcStroops=${body.faucet.adminUsdcStroops}`;
+    evidence.checks.health =
+      `protocolVersion=${body.protocolVersion} adminUsdcStroops=${body.faucet.adminUsdcStroops} ` +
+      `signerAuthorized=${String(body.signerAuthorized)}`;
   });
 
   it("faucet a una G… inexistente → 404 ACCOUNT_NOT_FOUND", async () => {

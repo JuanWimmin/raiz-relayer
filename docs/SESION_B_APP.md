@@ -56,7 +56,7 @@ mensaje/UI con cuenta atrás).
 | 401 | `UNAUTHORIZED_APP` | API key incorrecta/rotada → la app necesita actualización. `UNAUTHORIZED`. |
 | 413 | `PAYLOAD_TOO_LARGE` | `PARSE_ERROR`. |
 | 422 | `IDEMPOTENCY_MISMATCH` | Bug de reutilización de UUID. `UNKNOWN`. |
-| 502 | `UNAUTHORIZED_ADMIN` | Relayer mal configurado (no es admin). `UNAUTHORIZED`; no reintentar. |
+| 502 | `UNAUTHORIZED_ADMIN` | Relayer mal configurado (no es admin, o desde la 0.2.0 su clave no está autorizada para firmar por la cuenta admin: `details.txResult = txBadAuth`). `UNAUTHORIZED`; no reintentar. |
 | 502 | `TX_FAILED` | La tx se aplicó con fallo (`details.txResult`). `SIMULATION_FAILED`. |
 | 503 | `FAUCET_EMPTY` | Sin USDC en el admin → mensaje "faucet agotado, avisa al equipo". `INSUFFICIENT_BALANCE`. |
 | 503 | `RPC_UNREACHABLE`, `QUEUE_FULL` | `NETWORK_ERROR`, reintentable. |
@@ -76,6 +76,9 @@ Llamar al arrancar (o al entrar en el flujo admin) y cachear ~1 min:
   - `contracts.*` debe coincidir con el `deployments.json` de `assets/`; si no, avisar en log (deploy desfasado).
 - `ok == false` (503 `RPC_UNREACHABLE`) o error de red → mostrar el flujo admin como no disponible.
   No hay fallback local: el APK release ya no lleva la clave admin.
+- Desde la 0.2.0 del relayer el JSON trae además `signer` (clave pública con la que firma el
+  relayer) y `signerAuthorized` (`true` / `false` / `null`). Son diagnóstico para quien opera: la
+  app no los necesita (`RelayerJson` ignora claves desconocidas) y `admin` sigue siendo la cuenta.
 - `/v1/health` corta la consulta a RPC/Horizon a los 8 s: la app puede usar un timeout corto
   (~10 s) SOLO para esta llamada. Existe también `GET /v1/live` (`{ ok, uptimeSeconds }`, sin red):
   es el liveness del proxy de Fly, **no** un feature-flag; la app no lo necesita.

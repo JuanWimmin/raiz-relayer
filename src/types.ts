@@ -66,6 +66,11 @@ export interface HealthSnapshot {
   latestLedger: number;
   /** Balance USDC (stroops) de la cuenta admin, como string decimal. */
   adminUsdcStroops: string;
+  /**
+   * ¿La clave con la que firma el relayer puede firmar por la cuenta admin
+   * (firmante de la cuenta con peso suficiente)? `null` = no se pudo verificar.
+   */
+  signerAuthorized: boolean | null;
 }
 
 /**

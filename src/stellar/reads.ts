@@ -61,7 +61,8 @@ function errorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-function isHorizonNotFound(e: unknown): boolean {
+/** ¿El rechazo de Horizon significa "la cuenta no existe" (404)? Lo reutiliza signer.ts. */
+export function isHorizonNotFound(e: unknown): boolean {
   if (e instanceof NotFoundError) return true;
   // Cinturón y tirantes: cualquier NetworkError con status 404.
   if (typeof e === "object" && e !== null && "response" in e) {
@@ -129,7 +130,7 @@ export async function loadHorizonAccount(
 export async function adminUsdcBalanceStroops(horizon: HorizonLike, config: Config, logger?: Logger): Promise<bigint> {
   const info = await loadHorizonAccount(horizon, config.adminPublicKey, config.usdcIssuer, logger);
   if (!info.exists) {
-    // La cuenta que firma no existe: es un error de despliegue, no del cliente.
+    // La cuenta origen de las transacciones no existe: es un error de despliegue, no del cliente.
     throw new RelayerError("INTERNAL", "La cuenta admin del relayer no existe en la red (relayer mal configurado).", {
       admin: config.adminPublicKey,
     });

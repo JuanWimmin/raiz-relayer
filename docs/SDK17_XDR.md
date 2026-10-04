@@ -96,7 +96,15 @@ se envía igual por `rpcServer.sendTransaction`.
 
 Horizon: `new Horizon.Server(url).loadAccount(G…)` → `AccountResponse.balances`
 (`asset_type`, `asset_code`, `asset_issuer`, `balance`, `is_authorized`);
-cuenta inexistente → lanza `NotFoundError` (exportado del paquete).
+cuenta inexistente → lanza `NotFoundError` (exportado del paquete). La misma
+respuesta trae `.signers` (`{ key, weight, type }[]`; incluye la clave maestra
+aunque tenga peso 0) y `.thresholds` (`low_threshold`, `med_threshold`,
+`high_threshold`): es lo que lee `src/stellar/signer.ts`.
+
+Firma rechazada: `result.result.type === "txBadAuth"` (ninguna firma válida para
+la cuenta origen) o `"txFailed"` con `results[i].type === "opBadAuth"` (la clave
+es firmante pero su peso no llega al umbral de la operación) →
+`mapBadAuthResult` de `src/errors.ts`.
 
 ## Validación de direcciones
 

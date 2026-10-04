@@ -5,6 +5,7 @@ import {
   HTTP_BY_CODE,
   REBUILDABLE_TX_CODES,
   RelayerError,
+  mapBadAuthResult,
   mapContractError,
   mapPaymentOpResult,
   parseContractError,
@@ -295,5 +296,73 @@ describe("mapPaymentOpResult", () => {
     expect(e.code).toBe("TX_FAILED");
     expect(e.http).toBe(502);
     expect(e.details).toEqual({ opResult: "paymentLineFull", txResult: "txFailed" });
+  });
+});
+
+// ── Firma rechazada: la clave del relayer no vale para la cuenta admin ───────
+
+describe("mapBadAuthResult", () => {
+  it("txBadAuth → UNAUTHORIZED_ADMIN (502), error de servidor claro y NO reintentable", () => {
+    const e = mapBadAuthResult(txResult(xdr.TransactionResultResult.txBadAuth()));
+    expect(e).toBeInstanceOf(RelayerError);
+    expect(e?.code).toBe("UNAUTHORIZED_ADMIN");
+    expect(e?.http).toBe(502);
+    expect(e?.retryable).toBe(false);
+    expect(e?.message).toBe(
+      "La clave del relayer no está autorizada para firmar por la cuenta admin (clave rotada o relayer mal configurado).",
+    );
+    expect(e?.details).toEqual({ txResult: "txBadAuth" });
+    expect(e?.toBody()).toEqual({
+      ok: false,
+      error: {
+        code: "UNAUTHORIZED_ADMIN",
+        message: e?.message,
+        retryable: false,
+        details: { txResult: "txBadAuth" },
+      },
+    });
+  });
+
+  it("txFailed con opBadAuth (peso del firmante < umbral de la operación) → el mismo error, con details.opResult", () => {
+    const e = mapBadAuthResult(txResult(xdr.TransactionResultResult.txFailed([xdr.OperationResult.opBadAuth()])));
+    expect(e?.code).toBe("UNAUTHORIZED_ADMIN");
+    expect(e?.details).toEqual({ txResult: "txFailed", opResult: "opBadAuth" });
+  });
+
+  it("los details del llamador (cuenta, firmante, hash) se añaden a los códigos", () => {
+    const e = mapBadAuthResult(txResult(xdr.TransactionResultResult.txBadAuth()), {
+      admin: "GADMIN",
+      signer: "GSIGNER",
+      stage: "send",
+      txHash: "ab".repeat(32),
+    });
+    expect(e?.details).toEqual({
+      txResult: "txBadAuth",
+      admin: "GADMIN",
+      signer: "GSIGNER",
+      stage: "send",
+      txHash: "ab".repeat(32),
+    });
+  });
+
+  it("cualquier otro resultado → undefined (sigue su mapeo de siempre)", () => {
+    const others = [
+      xdr.TransactionResultResult.txSuccess([]),
+      xdr.TransactionResultResult.txBadSeq(),
+      xdr.TransactionResultResult.txTooLate(),
+      xdr.TransactionResultResult.txInsufficientFee(),
+      xdr.TransactionResultResult.txNoAccount(),
+      xdr.TransactionResultResult.txFailed([]),
+      xdr.TransactionResultResult.txFailed([paymentOp(xdr.PaymentResult.paymentNoTrust())]),
+      xdr.TransactionResultResult.txFailed([xdr.OperationResult.opNoAccount()]),
+    ];
+    for (const r of others) expect(mapBadAuthResult(txResult(r)), r.type).toBeUndefined();
+  });
+
+  it("round-trip XDR base64 (como llega del RPC) sigue reconociéndose", () => {
+    const original = txResult(xdr.TransactionResultResult.txBadAuth());
+    const back = xdr.TransactionResult.fromXdr(original.toXdr("base64"), "base64");
+    expect(txResultCodeName(back)).toBe("txBadAuth");
+    expect(mapBadAuthResult(back)?.code).toBe("UNAUTHORIZED_ADMIN");
   });
 });

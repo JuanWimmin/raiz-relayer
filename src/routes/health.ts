@@ -7,7 +7,9 @@
  * cuando la app necesita leer `ok:false` para apagar el flujo admin.
  *
  * `/v1/health` = feature-flag de la app (`ok` + `faucet.enabled` +
- * `vaultEndpoints`) con estado real de Stellar. La parte cara
+ * `vaultEndpoints`) con estado real de Stellar, y diagnóstico para quien opera
+ * (`admin` = la cuenta, `signer` + `signerAuthorized` = con qué clave firma el
+ * relayer y si esa clave puede firmar por la cuenta). La parte cara
  * (`service.health()`: RPC + Horizon) se cachea `healthCacheMs`; los campos
  * baratos (cupo restante, cola, uptime) se calculan en cada llamada. Un fallo
  * del servicio NO se cachea: el siguiente GET vuelve a probar. La ida al
@@ -91,7 +93,12 @@ export function registerHealthRoute(app: FastifyInstance, ctx: RouteContext): vo
       ok: true,
       network: config.network,
       protocolVersion: snap.protocolVersion,
+      /* `admin` es la CUENTA (deployments.admin); `signer`, la clave pública
+       * con la que firma el relayer (la maestra o un firmante de esa cuenta).
+       * `signerAuthorized`: true/false según el ledger, null = sin verificar. */
       admin: config.adminPublicKey,
+      signer: config.signerPublicKey,
+      signerAuthorized: snap.signerAuthorized,
       contracts,
       faucet: {
         enabled: adminUsdc >= config.faucetAmountStroops,

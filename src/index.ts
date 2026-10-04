@@ -1,8 +1,10 @@
 /**
  * Bootstrap del relayer.
  *
- * Orden: config (falla rápido y sin stack si está mal) → logger → servicio
- * Stellar → app HTTP → listen. Apagado ordenado en SIGTERM/SIGINT: deja de
+ * Orden: config (falla rápido y sin stack si está mal) → logger → verificación
+ * on-chain del firmante (¿la clave configurada puede firmar por la cuenta
+ * admin?; si no, el proceso se niega a arrancar) → servicio Stellar → app HTTP
+ * → listen. Apagado ordenado en SIGTERM/SIGINT: deja de
  * aceptar conexiones, drena la cola de transacciones y sale con 0. Las DOS
  * fases (cerrar el servidor HTTP + drenar la cola) comparten un único tope
  * de `DRAIN_MAX_MS` = 100 s, por debajo del `kill_timeout = 120` de Fly. Un
@@ -12,7 +14,9 @@
 import { buildApp } from "./app.js";
 import { ConfigError, loadConfig, redactConfig } from "./config.js";
 import { createLogger, type Logger } from "./logger.js";
+import { createClients } from "./stellar/client.js";
 import { createStellarService } from "./stellar/service.js";
+import { verifySignerAuthority } from "./stellar/signer.js";
 
 const DRAIN_POLL_MS = 500;
 /**
@@ -54,7 +58,7 @@ async function main(): Promise<void> {
     }
     throw e;
   }
-  const { config, adminKeypair } = loaded;
+  const { config, signerKeypair } = loaded;
 
   const pretty = Boolean(process.stdout.isTTY) && process.env.NODE_ENV !== "production";
   const logger = createLogger(config.logLevel, pretty);
@@ -68,7 +72,42 @@ async function main(): Promise<void> {
     exitAfterFlush(logger, 1);
   });
 
-  const service = createStellarService({ config, adminKeypair, logger });
+  const clients = createClients(config);
+
+  /* ¿La clave configurada PUEDE firmar por la cuenta admin? Sustituye a la
+   * antigua igualdad "el secret deriva a deployments.admin" (tras rotar la
+   * clave firma un firmante de la cuenta, no la maestra) con el mismo
+   * espíritu: nunca correr con una clave que no puede firmar por el admin.
+   * Solo una respuesta DEFINITIVA de Horizon impide arrancar. Si Horizon no
+   * contesta se arranca igual —un parpadeo suyo no debe dejar a Fly en
+   * crash-loop— y el estado queda "no verificado" (`signerAuthorized: null`)
+   * hasta que una lectura de /v1/health lo pueda comprobar. */
+  const keys = { admin: config.adminPublicKey, signer: config.signerPublicKey };
+  const authority = await verifySignerAuthority(clients.horizon, config, { logger });
+  if (authority.status === "unauthorized") {
+    logger.fatal(
+      { ...keys, reason: authority.reason },
+      `${authority.message} El relayer no arranca con una clave que no puede firmar por la cuenta admin.`,
+    );
+    exitAfterFlush(logger, 1);
+    return;
+  }
+  if (authority.status === "authorized") {
+    logger.info(
+      { ...keys, weight: authority.weight, required: authority.required },
+      "firmante verificado: puede firmar por la cuenta admin",
+    );
+  } else {
+    logger.warn(keys, `${authority.message} Se arranca igualmente; /v1/health lo volverá a comprobar.`);
+  }
+
+  const service = createStellarService({
+    config,
+    signerKeypair,
+    logger,
+    clients,
+    signerAuthorized: authority.status === "authorized" ? true : null,
+  });
   const app = await buildApp({ config, service, logger });
 
   await app.listen({ port: config.port, host: config.host });

@@ -23,9 +23,15 @@ Hasta la v0.1 de la app, los flujos que exigen `admin.require_auth()` en los con
 
 Con el relayer:
 
-- la clave admin vive **solo** en la variable de entorno `RELAYER_ADMIN_SECRET` del servidor;
+- la clave que firma por el admin vive **solo** en la variable de entorno `RELAYER_ADMIN_SECRET` del servidor;
 - la app llama a un endpoint JSON con una API key estática y recibe el `txHash`;
 - el APK release se verifica sin secretos (`grep -rE "S[A-Z0-9]{55}"` = 0).
+
+**Cuenta admin ≠ clave que firma.** La *cuenta* admin es la `G…` de `deployments.admin`
+(`GBLS7PL5…`): los contratos la guardan como admin, es el origen de todas las transacciones y no
+cambia. La *clave* con la que firma el relayer puede ser la maestra de esa cuenta o un firmante
+autorizado de ella. Desde la [rotación del 2026-10-04](#runbook-rotación-de-la-clave-del-admin) es un
+firmante (`GB42NCO6…`): la maestra —la que viajó en el APK 0.1.0— tiene peso 0 y ya no firma nada.
 
 ## Arquitectura en 10 líneas
 
@@ -90,7 +96,7 @@ antes de enviar nada) no se cachea y sí es seguro reintentar.
 | 422 | `IDEMPOTENCY_MISMATCH` | misma `idempotency-key`, body distinto |
 | 422 | `CONTRACT_ERROR` | otro error de contrato; `details.contract`, `details.contractCode`, `details.name?` |
 | 429 | `RATE_LIMITED` | `details.retryAfterSeconds` + header **`Retry-After`** |
-| 502 | `UNAUTHORIZED_ADMIN` | #3 en Pool/Governance/adapter: el relayer no es admin (mal configurado) |
+| 502 | `UNAUTHORIZED_ADMIN` | El relayer no puede actuar como admin (mal configurado): #3 en Pool/Governance/adapter, o la red rechaza su firma (`txBadAuth` / `opBadAuth`) porque la clave de `RELAYER_ADMIN_SECRET` no está autorizada para firmar por la cuenta admin (`details.txResult`, `details.admin`, `details.signer`) → [rotación](#runbook-rotación-de-la-clave-del-admin) |
 | 502 | `TX_FAILED` | tx aplicada con fallo; `details.txResult` |
 | 503 | `FAUCET_EMPTY` | balance USDC del admin < monto → [runbook](#runbook-re-fondear-el-faucet) |
 | 503 | `RPC_UNREACHABLE` | RPC/Horizon caídos o sin responder a tiempo (`/v1/health` corta a los 8 s; cada request al RPC a los `RPC_REQUEST_TIMEOUT_MS`) |
@@ -115,10 +121,11 @@ Es lo que sondean el `[[http_service.checks]]` de `fly.toml` y el `HEALTHCHECK` 
 
 ```jsonc
 200 { "ok": true, "network": "testnet", "protocolVersion": 28, "admin": "GBLS7PL5…",
+      "signer": "GB42NCO6…", "signerAuthorized": true,
       "contracts": { "pool": "…", "governance": "…", "treasury": "…", "rewards": "…", "yield_adapter": "…", "usdc_sac": "…" },
       "faucet": { "enabled": true, "amountStroops": "200000000", "adminUsdcStroops": "3412750000", "remainingToday": 50 },
       "limits": { "faucetPerAddressMinutes": 10, "faucetDaily": 50, "registerDaily": 20, "mintDaily": 20, "vaultDaily": 20 },
-      "vaultEndpoints": true, "queue": { "pending": 0 }, "version": "0.1.0", "uptimeSeconds": 123 }
+      "vaultEndpoints": true, "queue": { "pending": 0 }, "version": "0.2.0", "uptimeSeconds": 123 }
 503 { "ok": false, "error": { "code": "RPC_UNREACHABLE", … } }
 ```
 
@@ -126,6 +133,22 @@ Es lo que sondean el `[[http_service.checks]]` de `fly.toml` y el `HEALTHCHECK` 
 `vaultEndpoints` para mostrar u ocultar botones. Devuelve **503 `RPC_UNREACHABLE` cuando RPC/Horizon
 fallan o tardan más de 8 s** (el error no se cachea; el siguiente GET reintenta). Por eso el proxy
 NO sondea esta ruta: una caída de Stellar debe verse como `ok:false`, no como "relayer muerto".
+
+**Quién firma** (para quien opera; la app no usa estos campos): `admin` es la **cuenta** admin
+(`deployments.admin`: origen de las transacciones y dueña del USDC del faucet). `signer` es la
+clave pública con la que firma el relayer —la que deriva de `RELAYER_ADMIN_SECRET`: la maestra de
+esa cuenta o un firmante suyo— y `signerAuthorized` dice si esa clave puede firmar por la cuenta
+según el ledger:
+
+| `signerAuthorized` | Significado |
+|---|---|
+| `true` | `signer` está entre los `signers` de la cuenta con peso suficiente |
+| `false` | no lo está: p. ej. se retiró la clave con el relayer en marcha, sin redesplegar. Los POST responden `502 UNAUTHORIZED_ADMIN` |
+| `null` | aún no se pudo verificar: Horizon no ha respondido a esa comprobación, ni al arrancar ni después |
+
+Se comprueba [al arrancar](#verificación-del-firmante-al-arrancar) y se repite con cada lectura de
+salud (misma caché de 10 s), así que sigue al ledger aunque los firmantes cambien con el relayer en
+marcha. Una comprobación que falla no borra el último resultado verificado.
 
 | | `/v1/live` | `/v1/health` |
 |---|---|---|
@@ -155,8 +178,8 @@ req  { "address": "G…|C…", "barrioId": "<hex64>" }
 409  ALREADY_RESIDENT · 404 BARRIO_ADMIN_NOT_SET · 502 UNAUTHORIZED_ADMIN · 429 RATE_LIMITED
 ```
 
-El relayer firma como `barrio_admin = GBLS7PL5…` (el seed configura esa cuenta como admin de los 3
-barrios). Soulbound: nunca hay `transfer`. Cupo: 20/día.
+El relayer actúa como `barrio_admin = GBLS7PL5…` (la cuenta admin; el seed la configura como admin
+de los 3 barrios). Soulbound: nunca hay `transfer`. Cupo: 20/día.
 
 ### `POST /v1/faucet` → 20 USDC de Blend (`FAUCET_AMOUNT_STROOPS`)
 
@@ -203,7 +226,7 @@ Copia `.env.example` a `.env`. Obligatorias:
 | Variable | Significado |
 |---|---|
 | `NETWORK` | Debe ser exactamente `testnet`. Cualquier otro valor → el proceso no arranca. |
-| `RELAYER_ADMIN_SECRET` | Clave `S…` del admin del protocolo. **Debe derivar a `deployments.admin`** (`GBLS7PL5…`) o el proceso no arranca. Nunca al repo ni a logs. |
+| `RELAYER_ADMIN_SECRET` | Clave `S…` con la que firma el relayer: la maestra de la cuenta admin o un firmante autorizado de ella. La **cuenta** es siempre `deployments.admin` (`GBLS7PL5…`) y no depende de esta variable. Si la clave no puede firmar por esa cuenta, el proceso no arranca ([verificación on-chain](#verificación-del-firmante-al-arrancar)). Nunca al repo ni a logs. |
 | `RELAYER_APP_KEY` | API key estática que envía la app en `x-raiz-app-key` (≥ 16 chars). `openssl rand -hex 24`. |
 
 Opcionales (default entre paréntesis):
@@ -237,21 +260,43 @@ Consecuencia para el cliente (sesión B): el **timeout HTTP de la app debe ser �
 (`JOB_DEADLINE_MS` 70 s + `RPC_REQUEST_TIMEOUT_MS` 15 s + margen), porque una respuesta válida
 puede tardar hasta `JOB_TIMEOUT_MS`. Ver [`docs/SESION_B_APP.md`](docs/SESION_B_APP.md).
 
+### Verificación del firmante al arrancar
+
+Hasta la 0.1.0 el proceso exigía que `RELAYER_ADMIN_SECRET` derivara exactamente a
+`deployments.admin`. Desde la 0.2.0 la clave puede ser un firmante de esa cuenta, así que la
+comprobación pasa a hacerse **contra el ledger**, con el mismo espíritu (nunca correr con una clave
+que no puede firmar por el admin): antes de escuchar, el proceso carga la cuenta admin de Horizon y
+busca la clave pública del secret entre sus `signers`.
+
+| Resultado | Cuándo | Qué hace el relayer |
+|---|---|---|
+| autorizado | la clave está en `signers` con peso ≥ umbral medio de la cuenta (y ≥ 1: con umbral 0 sigue haciendo falta una firma válida) | arranca; `signerAuthorized: true` |
+| no autorizado | no está en `signers`, tiene peso 0 (p. ej. la maestra ya deshabilitada), su peso no llega al umbral, o la cuenta no existe en la red | **no arranca**: log `fatal` con la cuenta, el firmante y el motivo, y `exit 1` |
+| sin verificar | Horizon no responde tras 3 intentos (esperas de 1 s y 2 s) | arranca igualmente con un `warn` —un parpadeo de Horizon no debe dejar la máquina en crash-loop— y queda *sin verificar* hasta la primera lectura correcta de `/v1/health`, que repite la comprobación |
+
+`payment` e `invoke_host_function` —lo único que envía el relayer— son operaciones de umbral
+**medio**; el alto (el de `set_options`) no cuenta. Si la cuenta tuviera el umbral bajo por encima
+del medio también se exige ese, porque la red valida la transacción contra el bajo. Si aun así la
+red rechaza una firma (`txBadAuth` / `opBadAuth`), el POST responde `502 UNAUTHORIZED_ADMIN`, no
+reintentable.
+
 ---
 
 ## Setup local
 
 Requisitos: Node **22** (`.nvmrc`), npm, [Stellar CLI](https://developers.stellar.org/docs/tools/cli)
-con la identidad `raiz-admin` (la misma del monorepo).
+con la identidad `raiz-admin-signer`: la clave del firmante vigente de la cuenta admin. La cuenta
+sigue siendo la de `deployments.admin` (`GBLS7PL5…`); la identidad `raiz-admin` del monorepo es su
+clave **maestra**, que desde la rotación tiene peso 0 y ya no sirve para firmar.
 
 ```bash
 git clone https://github.com/JuanWimmin/raiz-relayer && cd raiz-relayer
 npm ci
 cp .env.example .env
 # Edita .env: RELAYER_APP_KEY=$(openssl rand -hex 24) y el secret desde la CLI (no lo pegues a mano):
-export RELAYER_ADMIN_SECRET=$(stellar keys show raiz-admin)
+export RELAYER_ADMIN_SECRET=$(stellar keys show raiz-admin-signer)
 npm run dev                # tsx watch src/index.ts
-curl -s http://localhost:8080/v1/health | jq .
+curl -s http://localhost:8080/v1/health | jq .      # signerAuthorized: true
 ```
 
 Prueba de humo de todos los endpoints contra un relayer vivo:
@@ -265,19 +310,20 @@ RELAYER_URL=https://raiz-relayer.fly.dev RELAYER_APP_KEY=… ./scripts/smoke.sh
 
 ```bash
 npm run typecheck   # tsc sobre src/ y test/
-npm test            # vitest: rate-limit, cola, idempotencia, encode ScVal, errores, submit (RPC falso), rutas (fastify.inject)
+npm test            # vitest: rate-limit, cola, idempotencia, encode ScVal, errores, firmante (Horizon falso), submit (RPC falso), rutas (fastify.inject)
 ```
 
 Integración real contra testnet (firma transacciones de verdad y consume cupos):
 
 ```bash
-export RELAYER_ADMIN_SECRET=$(stellar keys show raiz-admin)
+export RELAYER_ADMIN_SECRET=$(stellar keys show raiz-admin-signer)
 export RELAYER_APP_KEY=cualquier-cosa-de-16-chars
 RELAYER_IT=1 npm run test:it
 ```
 
-Necesita: red hacia `soroban-testnet.stellar.org` y `horizon-testnet.stellar.org`, el admin con
-XLM y ≥ 40 USDC de Blend (ver runbook), y `config/deployments.testnet.json` igual al deploy vigente.
+Necesita: red hacia `soroban-testnet.stellar.org` y `horizon-testnet.stellar.org`, la cuenta admin
+con XLM y ≥ 40 USDC de Blend (ver runbook), la clave del secret como firmante vigente de esa cuenta
+(es lo primero que comprueba la suite) y `config/deployments.testnet.json` igual al deploy vigente.
 Timeout por test: 180 s.
 
 ---
@@ -287,7 +333,7 @@ Timeout por test: 180 s.
 ```bash
 docker build -t raiz-relayer .
 docker run --rm -p 8080:8080 -e NETWORK=testnet \
-  -e RELAYER_ADMIN_SECRET="$(stellar keys show raiz-admin)" \
+  -e RELAYER_ADMIN_SECRET="$(stellar keys show raiz-admin-signer)" \
   -e RELAYER_APP_KEY="$RELAYER_APP_KEY" raiz-relayer
 ```
 
@@ -296,12 +342,16 @@ Fly.io (región `iad` — Ashburn; `bog` y `mia` están deprecadas en Fly y no a
 ```bash
 fly launch --no-deploy            # usa el fly.toml existente; no crees Postgres ni Redis
 fly secrets set NETWORK=testnet \
-  RELAYER_ADMIN_SECRET="$(stellar keys show raiz-admin)" \
+  RELAYER_ADMIN_SECRET="$(stellar keys show raiz-admin-signer)" \
   RELAYER_APP_KEY="$(openssl rand -hex 24)"
 fly deploy --ha=false             # ← SIEMPRE con --ha=false
 ```
 
-**Por qué una sola máquina:** el relayer mantiene **una cola serializada por clave admin**. Hay una
+`raiz-admin-signer` es la identidad del firmante vigente de la cuenta admin (la cuenta sigue siendo
+la de `deployments.admin`). Si el secret no puede firmar por esa cuenta la máquina no arranca: mira
+`fly logs` (línea `fatal` con el motivo) y el [runbook de rotación](#runbook-rotación-de-la-clave-del-admin).
+
+**Por qué una sola máquina:** el relayer mantiene **una cola serializada por cuenta admin**. Hay una
 única cuenta admin y, por tanto, un único sequence number en la red. Con dos máquinas cada una
 lleva su propia cola y se pisan la secuencia: `txBadSeq` intermitentes, reintentos que no arreglan
 nada y cupos diarios duplicados (los contadores son por proceso). `fly deploy` sin `--ha=false`
@@ -371,8 +421,17 @@ mitigaciones de abuso, no autenticación.
   `trustProxy` es una función que solo confía en el proxy de Fly (`fdaa::/16`) y loopback, así que
   `req.ip` (y el `remoteAddress` de los logs) tampoco se envenena rellenando `X-Forwarded-For`.
   Los 404 pasan por el mismo cubo. Sigue siendo por IP: una NAT grande comparte los 60/min.
-- **La clave admin solo está en env** (`RELAYER_ADMIN_SECRET`); el proceso verifica que deriva a
-  `deployments.admin`; pino redacta secret y headers; el `sim.error` crudo solo en `debug`.
+- **La clave que firma solo está en env** (`RELAYER_ADMIN_SECRET`); al arrancar el proceso
+  verifica on-chain que esa clave puede firmar por la cuenta admin (`deployments.admin`) y se niega
+  a arrancar si no; pino redacta secret y headers; el `sim.error` crudo solo en `debug`.
+- **La clave maestra del admin estuvo expuesta, y se rotó.** La clave maestra de la cuenta admin
+  estuvo embebida en el APK 0.1.0 de la app (`DEMO_ADMIN_SECRET`): quien tuviera ese APK podía
+  extraerla y firmar como admin del protocolo. El **2026-10-04 se rotó**: la cuenta admin conserva
+  su dirección (`GBLS7PL5…`, la que guardan los contratos), la clave maestra queda con **peso 0**
+  —ya no autoriza nada— y el relayer firma con un firmante nuevo (`GB42NCO6…`) que nunca estuvo en
+  un APK. La rotación corta el acceso de ahí en adelante; no deshace lo que se hubiera firmado con
+  la clave vieja mientras fue válida (el historial de la cuenta es público en Horizon).
+  Procedimiento: [runbook](#runbook-rotación-de-la-clave-del-admin).
 - **Sin CORS**: no se emiten cabeceras `Access-Control-*`, así que los navegadores bloquean el
   uso desde webs de terceros. La app nativa no necesita CORS.
 - **Allowlist de 6 contratos** (los 5 de RAÍZ + el SAC de USDC que exige el faucet; el SOW
@@ -393,6 +452,94 @@ Después hay que publicar un **nuevo APK** con la key nueva (`local.properties` 
 
 ---
 
+## Runbook: rotación de la clave del admin
+
+**Cuándo:** la clave con la que se firma por el admin se ha expuesto (o se sospecha), o toca
+cambiarla. **Qué cambia:** solo *quién firma*. La **cuenta admin no cambia** (`deployments.admin`,
+`GBLS7PL5…`): los contratos guardan esa `G…` como admin, así que no se tocan contratos,
+`deployments.json` ni la app. Se cambian los firmantes de la cuenta (operación clásica
+`set_options`) y el secret del relayer.
+
+El orden es lo que la hace segura: **primero** se añade la clave nueva y se comprueba que el
+relayer firma con ella; **solo después** se retira la vieja. En ningún momento la cuenta se queda
+sin un firmante válido. Con Stellar CLI (≥ 23):
+
+```bash
+NETWORK=testnet
+ADMIN=$(jq -r .admin config/deployments.testnet.json)   # la CUENTA admin → GBLS7PL5… (no cambia)
+ACTUAL=raiz-admin           # identidad que firma por la cuenta ANTES de rotar (el 2026-10-04, la maestra)
+NUEVO=raiz-admin-signer     # identidad nueva (en la siguiente rotación: ACTUAL=raiz-admin-signer y NUEVO=otro nombre)
+
+# (a) Generar la clave nueva. No hace falta fondearla: es un firmante, no una cuenta.
+stellar keys generate "$NUEVO"
+NUEVO_G=$(stellar keys address "$NUEVO")
+
+# (b) Añadirla como firmante de la cuenta admin, con peso 1. Firma la clave ACTUAL.
+stellar tx new set-options --source-account "$ADMIN" --sign-with-key "$ACTUAL" --network "$NETWORK" \
+  --signer "$NUEVO_G" --signer-weight 1
+
+# (c) Desplegar el relayer con RELAYER_ADMIN_SECRET = la clave nueva y comprobar que firma.
+#     El secret entra por stdin (no queda en la línea de comandos); Fly reinicia la máquina.
+#     OJO si aún corre una versión < 0.2.0: despliega ANTES la 0.2.0 (ver notas).
+printf 'RELAYER_ADMIN_SECRET=%s\n' "$(stellar keys show "$NUEVO")" | fly secrets import -a raiz-relayer
+curl -s https://raiz-relayer.fly.dev/v1/health | jq '{version, admin, signer, signerAuthorized}'
+#   → admin = $ADMIN (igual que antes), signer = $NUEVO_G, signerAuthorized = true
+#     (si `signer` aún es el anterior, la máquina no ha terminado de reiniciar: repite el curl)
+#   + un faucet REAL (POST /v1/faucet a una G… con trustline): el txHash debe aplicarse.
+
+# (d) SOLO ENTONCES retirar la clave vieja. La transacción la firma la clave NUEVA: si no
+#     pudiera firmar por la cuenta, falla y nada cambia; así es imposible bloquear la cuenta.
+#     · La vieja es la clave MAESTRA (caso del 2026-10-04): peso 0 y umbrales 1/1/1.
+stellar tx new set-options --source-account "$ADMIN" --sign-with-key "$NUEVO" --network "$NETWORK" \
+  --master-weight 0 --low-threshold 1 --med-threshold 1 --high-threshold 1
+#     · La vieja es OTRO firmante (rotaciones posteriores; la maestra ya está en 0): quitarlo.
+#       stellar tx new set-options --source-account "$ADMIN" --sign-with-key "$NUEVO" --network "$NETWORK" \
+#         --signer "$(stellar keys address "$ACTUAL")" --signer-weight 0
+
+# (e) Verificar en Horizon los firmantes y los umbrales, y que el relayer sigue autorizado.
+curl -s "https://horizon-testnet.stellar.org/accounts/$ADMIN" | jq '{thresholds, signers}'
+curl -s https://raiz-relayer.fly.dev/v1/health | jq '{signer, signerAuthorized}'   # true (cache 10 s)
+```
+
+Resultado esperado de (e) tras la rotación del 2026-10-04 (Horizon lista la clave maestra aunque
+tenga peso 0):
+
+```jsonc
+{ "thresholds": { "low_threshold": 1, "med_threshold": 1, "high_threshold": 1 },
+  "signers": [ { "weight": 1, "key": "GB42NCO6…", "type": "ed25519_public_key" },     // firmante del relayer
+               { "weight": 0, "key": "GBLS7PL5…", "type": "ed25519_public_key" } ] }  // maestra, deshabilitada
+```
+
+Lo que se ejecutó ese día, con horas y hashes:
+[`docs/evidencia/rotacion_clave_2026-10-04.md`](docs/evidencia/rotacion_clave_2026-10-04.md).
+
+Notas:
+
+- **(b) siempre con `--source-account "$ADMIN"`.** La transacción sale de la *cuenta* y la firma la
+  identidad actual. Solo cuando esa identidad es la clave maestra (como el 2026-10-04) vale el
+  atajo `--source-account "$ACTUAL"`, porque su dirección *es* la cuenta. Con un firmante, ese atajo
+  apuntaría a la dirección del firmante, que no es la cuenta admin.
+- **(c) partiendo de un relayer 0.1.0:** esa versión exigía que el secret derivara a
+  `deployments.admin` y **no arranca** con la clave de un firmante, así que no cambies el secret con
+  ella en marcha. Deja el secret preparado sin reiniciar (`… | fly secrets import --stage -a raiz-relayer`)
+  y despliega la 0.2.0 (`fly deploy --ha=false`), que arranca ya con la clave nueva: así se hizo el
+  2026-10-04. Con una 0.2.0 o posterior ya en marcha basta el cambio de secret de arriba.
+- **Si (c) falla** (`signerAuthorized` no es `true`, o la máquina no arranca: `fly logs` trae una
+  línea `fatal` con la cuenta, el firmante y el motivo), vuelve a poner el secret anterior: hasta
+  (d) la clave vieja sigue siendo válida y no se ha perdido nada.
+- **Pesos y umbrales en (d):** el firmante nuevo debe pesar al menos tanto como el umbral más alto
+  que fijes (aquí 1 ≥ 1/1/1). Un umbral por encima del peso total de los firmantes sí bloquearía la
+  cuenta, y eso ya no lo impide firmar con la clave nueva.
+- **Si se hace (d) sin (c)** (el relayer sigue con la clave vieja): los POST responden
+  `502 UNAUTHORIZED_ADMIN` y `/v1/health` pasa a `signerAuthorized: false`. Se arregla con (c).
+- **Fuera de este repo:** todo lo que firmaba con la identidad vieja deja de valer. En el monorepo,
+  los comandos con `--source raiz-admin` pasan a
+  `--source-account "$ADMIN" --sign-with-key raiz-admin-signer`.
+- El secret viejo se da por quemado: bórralo de donde estuviera (`fly secrets`, `.env`, gestores) y
+  no lo reutilices.
+
+---
+
 ## Runbook: re-fondear el faucet
 
 **Síntoma:** `POST /v1/faucet` responde `503 FAUCET_EMPTY`, o `GET /v1/health` muestra
@@ -405,11 +552,11 @@ que se firma con la clave de la cuenta y se envía.
 **El faucet de Blend sirve UNA sola vez por cuenta** (verificado el 2026-08-27: para el admin, que ya
 reclamó, devuelve un envelope sin operaciones que el CLI rechaza con "failed to decode XDR"). Por eso
 el procedimiento es: identidad donante nueva → faucet → pago clásico de 1 000 USDC al admin.
-Con Stellar CLI (≥ 23) y la identidad `raiz-admin` ya configurada:
+Con Stellar CLI (≥ 23); no hace falta ninguna clave del admin (el donante firma lo suyo):
 
 ```bash
 NETWORK=testnet
-ADMIN=$(stellar keys address raiz-admin)         # → GBLS7PL5…
+ADMIN=$(jq -r .admin config/deployments.testnet.json)   # la CUENTA admin → GBLS7PL5…
 USDC_ISSUER=GATALTGTWIOT6BUDBCZM3Q4OQ4BO2COLOAZ7IYSKPLC2PMSOPPGF5V56
 DONOR=raiz-faucet-donor-$(date +%s)               # identidad temporal, una por re-fondeo
 
@@ -437,7 +584,7 @@ curl -s "https://horizon-testnet.stellar.org/accounts/$ADMIN" \
 curl -s https://raiz-relayer.fly.dev/v1/health | jq .faucet     # enabled=true, adminUsdcStroops actualizado (cache 10 s)
 ```
 
-Si el admin también anda corto de XLM (fees), `stellar keys fund raiz-admin --network testnet`
+Si el admin también anda corto de XLM (fees), `curl -s "https://friendbot.stellar.org/?addr=$ADMIN"`
 (friendbot) o cualquier faucet de XLM de testnet.
 
 ---
@@ -451,8 +598,16 @@ curl -s https://raiz-relayer.fly.dev/v1/live   | jq .    # { ok: true, uptimeSec
 curl -s https://raiz-relayer.fly.dev/v1/health | jq .
 ```
 
-`/v1/health` debe devolver `ok: true`, `network: "testnet"`, `admin: "GBLS7PL5…"` y los contratos
-iguales a `config/deployments.testnet.json` (= `deployments.json` del monorepo).
+`/v1/health` debe devolver `ok: true`, `network: "testnet"`, `admin: "GBLS7PL5…"` (la cuenta),
+`signer: "GB42NCO6…"` con `signerAuthorized: true` (la clave con la que firma el relayer, autorizada
+en esa cuenta) y los contratos iguales a `config/deployments.testnet.json` (= `deployments.json` del
+monorepo). Que `signer` es un firmante de la cuenta y que la clave maestra tiene peso 0 se comprueba
+sin fiarse del relayer:
+
+```bash
+curl -s https://horizon-testnet.stellar.org/accounts/GBLS7PL5Y65DHQIPMJO6HVQLX4FXEEHQDWHGSBUTGT4V6ZV2IOACYC2P \
+  | jq '{thresholds, signers}'
+```
 
 Con la API key (la del APK o una que te pase el equipo), un `POST` devuelve un `txHash`; se
 comprueba on-chain en Stellar Expert:
@@ -461,9 +616,10 @@ comprueba on-chain en Stellar Expert:
 https://stellar.expert/explorer/testnet/tx/<txHash>
 ```
 
-Allí se ve el firmante (`GBLS7PL5…`), la operación (`invokeHostFunction` o `payment`) y el
-contrato invocado. Los hashes de la sesión de evidencia están archivados en el monorepo,
-`docs/evidencia_sow/d1/`.
+Allí se ve la cuenta origen (`GBLS7PL5…`, el admin), quién firmó (el firmante del relayer,
+`GB42NCO6…`; en las transacciones anteriores al 2026-10-04, la clave maestra de la propia cuenta),
+la operación (`invokeHostFunction` o `payment`) y el contrato invocado. Los hashes de la sesión de
+evidencia están archivados en el monorepo, `docs/evidencia_sow/d1/`.
 
 Verificación de "cero secretos" en el APK release (comando literal del plan del SOW):
 

@@ -377,6 +377,36 @@ export function mapPaymentOpResult(name: string, raw?: string): RelayerError {
   }
 }
 
+/**
+ * ¿La red rechazó la FIRMA del sobre? Tiene dos formas de decirlo:
+ *  - `txBadAuth`: no hay firma válida para la cuenta origen (la clave del
+ *    relayer no es firmante de la cuenta admin, tiene peso 0 o no llega al
+ *    umbral bajo).
+ *  - `txFailed` con `opBadAuth`: la clave es firmante, pero su peso no alcanza
+ *    el umbral de la operación (medio para `payment` e `invoke_host_function`).
+ * En los dos casos el fallo es del despliegue (clave rotada o mal configurada),
+ * no del cliente, y reintentar no lo arregla: UNAUTHORIZED_ADMIN (502, no
+ * reintentable), el mismo código que "el relayer no es admin". Devuelve
+ * undefined si el resultado es otro.
+ */
+export function mapBadAuthResult(result: xdr.TransactionResult, details?: ErrorDetails): RelayerError | undefined {
+  let codes: ErrorDetails;
+  try {
+    const r = result.result;
+    if (r.type === "txBadAuth") codes = { txResult: r.type };
+    else if (r.type === "txFailed" && r.results.some((op) => op.type === "opBadAuth")) {
+      codes = { txResult: r.type, opResult: "opBadAuth" };
+    } else return undefined;
+  } catch {
+    return undefined;
+  }
+  return new RelayerError(
+    "UNAUTHORIZED_ADMIN",
+    "La clave del relayer no está autorizada para firmar por la cuenta admin (clave rotada o relayer mal configurado).",
+    { ...codes, ...details },
+  );
+}
+
 /** Decodifica un ScVal devuelto por simulación a nativo, o undefined si no se puede. */
 export function safeScValToNative<T = unknown>(v: xdr.ScVal | undefined | null): T | undefined {
   if (v == null) return undefined;

@@ -19,22 +19,28 @@ import {
   type Horizon,
 } from "@stellar/stellar-sdk";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { loadConfig, type Config } from "../src/config.js";
+import { loadConfig, redactConfig, type Config } from "../src/config.js";
 import { RelayerError } from "../src/errors.js";
 import { createLogger } from "../src/logger.js";
 import { SerialQueue } from "../src/queue.js";
 import type { ContractRpcLike, HorizonLike } from "../src/stellar/reads.js";
 import { createStellarService } from "../src/stellar/service.js";
+import type { SignerAccountLike } from "../src/stellar/signer.js";
 import { submitTransaction, type RpcLike, type SubmitDeps, type SubmitSpec } from "../src/stellar/submit.js";
 
 const logger = createLogger("silent");
 const GetTxStatus = sdkRpc.Api.GetTransactionStatus;
 
 // ── Config real desde un deployments.json temporal con admin = Keypair.random() ─
+// Escenario de clave rotada: `admin` es la CUENTA (deployments.admin) y el
+// relayer firma con OTRA clave (`signer`, un firmante de esa cuenta). Así toda
+// la batería corre con cuenta ≠ firmante; el caso "firma la maestra" se cubre
+// aparte en los tests de loadConfig.
 
 const admin = Keypair.random();
+const signer = Keypair.random();
 let config: Config;
-let adminKeypair: Keypair;
+let signerKeypair: Keypair;
 let tmpDeployments: string;
 
 beforeAll(() => {
@@ -43,9 +49,9 @@ beforeAll(() => {
   ) as Record<string, unknown>;
   tmpDeployments = join(tmpdir(), `raiz-relayer-deployments-${process.pid}-${Date.now()}.json`);
   writeFileSync(tmpDeployments, JSON.stringify({ ...base, admin: admin.publicKey() }));
-  ({ config, adminKeypair } = loadConfig({
+  ({ config, signerKeypair } = loadConfig({
     NETWORK: "testnet",
-    RELAYER_ADMIN_SECRET: admin.secret(),
+    RELAYER_ADMIN_SECRET: signer.secret(),
     RELAYER_APP_KEY: "x".repeat(32),
     DEPLOYMENTS_FILE: tmpDeployments,
   }));
@@ -174,6 +180,9 @@ class FakeRpc implements RpcLike, ContractRpcLike {
     this.tick(this.latencyMs);
     return { id: "x", sequence: 100, protocolVersion: "28", closeTime: "1" } as unknown as sdkRpc.Api.GetLatestLedgerResponse;
   }
+  async getNetwork(): Promise<{ passphrase: string; protocolVersion: string }> {
+    return { passphrase: Networks.TESTNET, protocolVersion: "28" };
+  }
   async getContractInstance(contractId: string): Promise<unknown> {
     this.tick(this.latencyMs);
     this.contractInstanceCalls.push(contractId);
@@ -186,18 +195,25 @@ class FakeRpc implements RpcLike, ContractRpcLike {
   }
 }
 
-/** Horizon falso: mapa de cuentas → balances; cuenta ausente → NotFoundError como el SDK. */
+/**
+ * Horizon falso: mapa de cuentas → balances; cuenta ausente → NotFoundError como el SDK.
+ * `multisig` añade `signers`/`thresholds` a la respuesta de una cuenta (lo que
+ * lee la verificación del firmante); sin ellos esa lectura no es verificable.
+ */
 class FakeHorizon implements HorizonLike {
   accounts = new Map<string, Horizon.HorizonApi.BalanceLine[]>();
+  multisig = new Map<string, SignerAccountLike>();
   calls: string[] = [];
   failWith: Error | undefined;
 
-  async loadAccount(accountId: string): Promise<{ balances: Horizon.HorizonApi.BalanceLine[] }> {
+  async loadAccount(
+    accountId: string,
+  ): Promise<{ balances: Horizon.HorizonApi.BalanceLine[] } & Partial<SignerAccountLike>> {
     this.calls.push(accountId);
     if (this.failWith) throw this.failWith;
     const balances = this.accounts.get(accountId);
     if (!balances) throw new NotFoundError("Not Found", { status: 404 });
-    return { balances };
+    return { balances, ...this.multisig.get(accountId) };
   }
 }
 
@@ -218,7 +234,7 @@ function usdcLine(balance: string, authorized = true): Horizon.HorizonApi.Balanc
 }
 
 function deps(rpc: FakeRpc, clock = fakeClock()): SubmitDeps {
-  return { rpc, keypair: adminKeypair, config, logger, now: clock.now, sleep: clock.sleep };
+  return { rpc, keypair: signerKeypair, config, logger, now: clock.now, sleep: clock.sleep };
 }
 
 function sorobanSpec(contractId: string, method = "mint_resident"): SubmitSpec {
@@ -271,10 +287,60 @@ async function relayerError(p: Promise<unknown>): Promise<RelayerError> {
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
+describe("loadConfig — cuenta admin y clave que firma", () => {
+  const envWith = (secret: string) => ({
+    NETWORK: "testnet",
+    RELAYER_ADMIN_SECRET: secret,
+    RELAYER_APP_KEY: "x".repeat(32),
+    DEPLOYMENTS_FILE: tmpDeployments,
+  });
+
+  it("acepta un secret que NO deriva a deployments.admin: adminPublicKey es la cuenta y signerPublicKey la del secret", () => {
+    expect(signer.publicKey()).not.toBe(admin.publicKey());
+    expect(config.adminPublicKey).toBe(admin.publicKey());
+    expect(config.adminPublicKey).toBe(config.deployments.admin);
+    expect(config.signerPublicKey).toBe(signer.publicKey());
+    // El keypair que se devuelve (el que firma) es el del secret, no el de la cuenta.
+    expect(signerKeypair.publicKey()).toBe(signer.publicKey());
+    expect(signerKeypair.canSign()).toBe(true);
+  });
+
+  it("con la clave maestra (el secret deriva a deployments.admin) cuenta y firmante coinciden", () => {
+    const loaded = loadConfig(envWith(admin.secret()));
+    expect(loaded.config.adminPublicKey).toBe(admin.publicKey());
+    expect(loaded.config.signerPublicKey).toBe(admin.publicKey());
+    expect(loaded.signerKeypair.publicKey()).toBe(admin.publicKey());
+  });
+
+  it("sigue exigiendo una seed ed25519 válida, y el mensaje no repite el valor recibido", () => {
+    const notASeed = `S${"A".repeat(55)}`; // forma de seed, checksum inválido
+    for (const bad of [notASeed, signer.publicKey(), ""]) {
+      let message = "";
+      try {
+        loadConfig(envWith(bad));
+      } catch (e) {
+        message = (e as Error).message;
+      }
+      expect(message, bad).toMatch(/RELAYER_ADMIN_SECRET no es una seed ed25519 válida/);
+      if (bad) expect(message).not.toContain(bad);
+    }
+    const { RELAYER_ADMIN_SECRET: _omit, ...withoutSecret } = envWith("x");
+    expect(() => loadConfig(withoutSecret)).toThrow(/Falta RELAYER_ADMIN_SECRET.*con la que firma el relayer/);
+  });
+
+  it("redactConfig lleva las dos claves PÚBLICAS y ni rastro del secret ni de la app key", () => {
+    const safe = JSON.stringify(redactConfig(config));
+    expect(safe).toContain(admin.publicKey());
+    expect(safe).toContain(signer.publicKey());
+    expect(safe).not.toContain(signer.secret());
+    expect(safe).not.toContain("x".repeat(32));
+  });
+});
+
 describe("loadConfig — presupuesto de tiempo", () => {
   const baseEnv = () => ({
     NETWORK: "testnet",
-    RELAYER_ADMIN_SECRET: admin.secret(),
+    RELAYER_ADMIN_SECRET: signer.secret(),
     RELAYER_APP_KEY: "x".repeat(32),
     DEPLOYMENTS_FILE: tmpDeployments,
   });
@@ -319,6 +385,25 @@ describe("submitTransaction", () => {
     expect(rpc.getCalls).toBe(3);
     // Tres esperas de poll de 3 s, ninguna de backoff.
     expect(clock.sleeps).toEqual([3_000, 3_000, 3_000]);
+  });
+
+  it("(1b) cuenta ≠ firmante: el ORIGEN del sobre es la cuenta admin y la ÚNICA firma es la de la clave del relayer", async () => {
+    for (const spec of [sorobanSpec(config.contracts.governance), classicSpec()]) {
+      const rpc = new FakeRpc();
+      rpc.sendQueue = [sendPending()];
+      rpc.getQueue = [getSuccess()];
+      await submitTransaction(deps(rpc), spec);
+
+      const sent = new Transaction(rpc.sentXdrs[0] ?? "", Networks.TESTNET);
+      // La secuencia se pidió para la cuenta, y la cuenta es el source (credenciales de cuenta origen).
+      expect(sent.source).toBe(admin.publicKey());
+      expect(sent.source).not.toBe(signer.publicKey());
+      expect(sent.signatures).toHaveLength(1);
+      const [sig] = sent.signatures;
+      expect(Buffer.from(sig!.hint.toBytes()).equals(Buffer.from(signer.signatureHint()))).toBe(true);
+      expect(signer.verify(sent.hash(), sig!.signature)).toBe(true);
+      expect(admin.verify(sent.hash(), sig!.signature)).toBe(false);
+    }
   });
 
   it("(2) simulación con Error(Contract, #5) contra Governance → ALREADY_RESIDENT sin enviar nada", async () => {
@@ -606,6 +691,72 @@ describe("submitTransaction", () => {
     expect(e.details).toMatchObject({ txResult: "txFailed", txHash: hashOfXdr(rpc.sentXdrs[0] ?? "") });
   });
 
+  it("(7d) send ERROR txBadAuth → UNAUTHORIZED_ADMIN no reintentable, con cuenta y firmante; sin rebuild ni poll", async () => {
+    // La clave del relayer no es (o ya no es) un firmante válido de la cuenta
+    // admin: la red rechaza el sobre de entrada. Reconstruir no arregla nada.
+    for (const spec of [sorobanSpec(config.contracts.governance), classicSpec()]) {
+      const rpc = new FakeRpc();
+      rpc.sendQueue = [sendError(txResult(xdr.TransactionResultResult.txBadAuth())), sendPending()];
+      rpc.getQueue = [getSuccess()];
+
+      const e = await relayerError(submitTransaction(deps(rpc), spec));
+      expect(e.code).toBe("UNAUTHORIZED_ADMIN");
+      expect(e.http).toBe(502);
+      expect(e.retryable).toBe(false);
+      expect(e.message).toContain("no está autorizada para firmar por la cuenta admin");
+      expect(e.details).toEqual({
+        txResult: "txBadAuth",
+        admin: admin.publicKey(),
+        signer: signer.publicKey(),
+        stage: "send",
+        txHash: hashOfXdr(rpc.sentXdrs[0] ?? ""),
+      });
+      expect(rpc.getAccountCalls).toBe(1); // ni un rebuild
+      expect(rpc.sentXdrs).toHaveLength(1); // ni un reenvío
+      expect(rpc.getCalls).toBe(0);
+    }
+  });
+
+  it("(7e) txFailed con opBadAuth (el peso del firmante no llega al umbral de la operación) → UNAUTHORIZED_ADMIN, en el send y en el poll", async () => {
+    const opBadAuth = () => txResult(xdr.TransactionResultResult.txFailed([xdr.OperationResult.opBadAuth()]));
+
+    // Rechazada al enviar (clásico): no cae en el TX_FAILED genérico de mapPaymentOpResult.
+    const atSend = new FakeRpc();
+    atSend.sendQueue = [sendError(opBadAuth())];
+    const e1 = await relayerError(submitTransaction(deps(atSend), classicSpec()));
+    expect(e1.code).toBe("UNAUTHORIZED_ADMIN");
+    expect(e1.details).toMatchObject({ txResult: "txFailed", opResult: "opBadAuth", stage: "send" });
+    expect(atSend.getCalls).toBe(0);
+
+    // Aplicada con fallo (soroban): los firmantes cambiaron entre el envío y el cierre del ledger.
+    const atApply = new FakeRpc();
+    atApply.sendQueue = [sendPending()];
+    atApply.getQueue = [getFailed(opBadAuth(), 4_365_480)];
+    const e2 = await relayerError(submitTransaction(deps(atApply), sorobanSpec(config.contracts.pool)));
+    expect(e2.code).toBe("UNAUTHORIZED_ADMIN");
+    expect(e2.retryable).toBe(false);
+    expect(e2.details).toEqual({
+      txResult: "txFailed",
+      opResult: "opBadAuth",
+      admin: admin.publicKey(),
+      signer: signer.publicKey(),
+      txHash: hashOfXdr(atApply.sentXdrs[0] ?? ""),
+      ledger: 4_365_480,
+    });
+    expect(atApply.getAccountCalls).toBe(1);
+  });
+
+  it("(7f) txBadAuth aplicada on-chain (poll FAILED) → UNAUTHORIZED_ADMIN, no TX_FAILED", async () => {
+    const rpc = new FakeRpc();
+    rpc.sendQueue = [sendPending()];
+    rpc.getQueue = [getFailed(txResult(xdr.TransactionResultResult.txBadAuth()))];
+
+    const e = await relayerError(submitTransaction(deps(rpc), sorobanSpec(config.contracts.governance)));
+    expect(e.code).toBe("UNAUTHORIZED_ADMIN");
+    expect(e.details).toMatchObject({ txResult: "txBadAuth", txHash: hashOfXdr(rpc.sentXdrs[0] ?? "") });
+    expect(rpc.getAccountCalls).toBe(1);
+  });
+
   it("(8) allowlist: contractId desconocido → INTERNAL sin tocar el RPC", async () => {
     const rpc = new FakeRpc();
     const unknownContract = StrKey.encodeContract(new Uint8Array(32).fill(7));
@@ -689,13 +840,14 @@ describe("submitTransaction — txBadSeq tras un reenvío no reconstruye", () =>
 // ── createStellarService: preflights y orden cupo → cola ─────────────────────
 
 describe("createStellarService — preflights del faucet y orden assertCapacity → afterPreflight → enqueue", () => {
-  function makeService(rpc: FakeRpc, horizon: FakeHorizon, queue?: SerialQueue) {
+  function makeService(rpc: FakeRpc, horizon: FakeHorizon, queue?: SerialQueue, signerAuthorized?: boolean | null) {
     return createStellarService({
       config,
-      adminKeypair,
+      signerKeypair,
       logger,
       clients: { rpc: rpc as unknown as sdkRpc.Server, horizon: horizon as unknown as Horizon.Server },
       ...(queue ? { queue } : {}),
+      ...(signerAuthorized !== undefined ? { signerAuthorized } : {}),
     });
   }
 
@@ -858,5 +1010,74 @@ describe("createStellarService — preflights del faucet y orden assertCapacity 
     expect(afterPreflight).not.toHaveBeenCalled();
     expect(rpc.simulated).toHaveLength(1); // solo la lectura get_merchant
     expect(rpc.sentXdrs).toHaveLength(0);
+  });
+
+  // ── health(): ¿la clave del relayer puede firmar por la cuenta admin? ──────
+
+  /** Cuenta admin ya rotada: la maestra con peso 0 y el firmante del relayer con peso 1, umbrales 1/1/1. */
+  const rotatedAccount = (): SignerAccountLike => ({
+    signers: [
+      { key: signer.publicKey(), weight: 1 },
+      { key: admin.publicKey(), weight: 0 },
+    ],
+    thresholds: { low_threshold: 1, med_threshold: 1 },
+  });
+
+  it("(14) health(): signerAuthorized sigue al ledger — null sin verificar, true con peso suficiente, false si la cuenta retira al firmante", async () => {
+    const horizon = fundedHorizon();
+    const service = makeService(new FakeRpc(), horizon);
+
+    // Horizon no trae signers/thresholds: no se puede verificar → "no verificado".
+    expect((await service.health()).signerAuthorized).toBeNull();
+
+    horizon.multisig.set(admin.publicKey(), rotatedAccount());
+    expect(await service.health()).toEqual({
+      protocolVersion: 28,
+      latestLedger: 100,
+      adminUsdcStroops: "1000000000",
+      signerAuthorized: true,
+    });
+
+    // Una lectura que no se puede verificar NO degrada el último estado verificado.
+    horizon.multisig.delete(admin.publicKey());
+    expect((await service.health()).signerAuthorized).toBe(true);
+
+    // La cuenta retira al firmante (p. ej. otra rotación sin redeploy del relayer).
+    horizon.multisig.set(admin.publicKey(), {
+      signers: [{ key: admin.publicKey(), weight: 1 }],
+      thresholds: { low_threshold: 1, med_threshold: 1 },
+    });
+    expect((await service.health()).signerAuthorized).toBe(false);
+
+    // …y lo vuelve a autorizar.
+    horizon.multisig.set(admin.publicKey(), rotatedAccount());
+    expect((await service.health()).signerAuthorized).toBe(true);
+
+    // Siempre se consulta la CUENTA admin; la clave del firmante no es una cuenta.
+    expect(new Set(horizon.calls)).toEqual(new Set([admin.publicKey()]));
+  });
+
+  it("(14b) health(): parte del resultado del arranque y lo conserva mientras no haya una lectura que lo confirme o lo desmienta", async () => {
+    const verifiedAtBoot = makeService(new FakeRpc(), fundedHorizon(), undefined, true);
+    expect((await verifiedAtBoot.health()).signerAuthorized).toBe(true);
+
+    const unknownAtBoot = makeService(new FakeRpc(), fundedHorizon(), undefined, null);
+    expect((await unknownAtBoot.health()).signerAuthorized).toBeNull();
+  });
+
+  it("(14c) health(): con Horizon caído sigue saliendo RPC_UNREACHABLE; la verificación del firmante no lanza ni cambia el error", async () => {
+    const horizon = fundedHorizon();
+    horizon.multisig.set(admin.publicKey(), rotatedAccount());
+    const service = makeService(new FakeRpc(), horizon);
+    expect((await service.health()).signerAuthorized).toBe(true);
+
+    horizon.failWith = new Error("socket hang up host-interno");
+    const e = await relayerError(service.health());
+    expect(e.code).toBe("RPC_UNREACHABLE");
+    expect(e.details).toEqual({ stage: "horizon.loadAccount" });
+
+    // Al volver Horizon, el estado verificado sigue ahí.
+    horizon.failWith = undefined;
+    expect((await service.health()).signerAuthorized).toBe(true);
   });
 });
