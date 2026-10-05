@@ -7,8 +7,10 @@ endpoints está en el [README](../README.md); aquí solo va lo que afecta al có
 ## 1. Cliente HTTP (`data/relayer/RelayerClient.kt`, Ktor)
 
 - **Base URL**: `BuildConfig.RELAYER_URL` (desde `local.properties`, default = servicio desplegado).
-- **Header obligatorio en todos los POST**: `x-raiz-app-key: ${BuildConfig.RELAYER_APP_KEY}`
-  (`local.properties` → `BuildConfig`; nunca en el repo). `GET /v1/health` no lo necesita.
+- **Sin cabecera de autenticación** (relayer ≥ 0.3.0): no hay API key y el APK no necesita ninguna
+  credencial para llamar. Hasta la 0.2.0 los POST exigían `x-raiz-app-key:
+  ${BuildConfig.RELAYER_APP_KEY}`; los APK que aún la envían siguen funcionando porque el relayer la
+  ignora, y una versión nueva de la app debe dejar de llevarla.
 - **`content-type: application/json`**, body ≤ 8 KB (413 `PAYLOAD_TOO_LARGE` si no).
 - **Timeout HTTP del cliente ≥ 95 s** (`requestTimeoutMillis = 95_000`, y `socketTimeoutMillis`
   igual). El relayer serializa una cola y cada job tiene un deadline de 70 s (`JOB_DEADLINE_MS`)
@@ -51,9 +53,8 @@ mensaje/UI con cuenta atrás).
 | 422 | `TRUSTLINE_DEAUTHORIZED` | Raro en testnet. `UNAUTHORIZED`. |
 | 404 | `BARRIO_NOT_FOUND`, `BARRIO_ADMIN_NOT_SET` | Datos de barrio incoherentes con el deploy vigente (deployments.json desactualizado en assets). `NOT_FOUND`. |
 | 422 | `CONTRACT_ERROR` | `details.contract` ∈ {pool, yield_adapter, blend_pool}, `details.contractCode`, `details.name?`. Para Yield: `INSUFFICIENT_LIQUIDITY` → mensaje de colchón; `INSUFFICIENT_SHARES` → nada que retirar. Default `SIMULATION_FAILED`. |
-| 429 | `RATE_LIMITED` | `RATE_LIMITED` (nuevo). Usar `details.retryAfterSeconds` (también header `Retry-After`) para mostrar "vuelve a intentarlo en N min". |
+| 429 | `RATE_LIMITED` | `RATE_LIMITED` (nuevo). Usar `details.retryAfterSeconds` (también header `Retry-After`) para mostrar "vuelve a intentarlo en N min". Desde la 0.3.0 hay además cupos diarios por IP: `details.limit` (y el mensaje) terminan en `de esta red/IP` cuando se agotó el de la red del usuario —desde otra red sí podría— o en `global` cuando no queda cupo para nadie hasta las 00:00 UTC. |
 | 400 | `VALIDATION_ERROR` | Bug de la app (body mal formado). `PARSE_ERROR`; loguear `details`. |
-| 401 | `UNAUTHORIZED_APP` | API key incorrecta/rotada → la app necesita actualización. `UNAUTHORIZED`. |
 | 413 | `PAYLOAD_TOO_LARGE` | `PARSE_ERROR`. |
 | 422 | `IDEMPOTENCY_MISMATCH` | Bug de reutilización de UUID. `UNKNOWN`. |
 | 502 | `UNAUTHORIZED_ADMIN` | Relayer mal configurado (no es admin, o desde la 0.2.0 su clave no está autorizada para firmar por la cuenta admin: `details.txResult = txBadAuth`). `UNAUTHORIZED`; no reintentar. |
@@ -64,6 +65,9 @@ mensaje/UI con cuenta atrás).
 | 503 | `TX_TIMEOUT` | Trae `details.txHash`: la tx **puede aplicarse después**. Con `txHash` el relayer lo **cachea 10 min por `idempotency-key`**: reintentar con la MISMA key devuelve el mismo hash y NO re-firma. No repetir a ciegas ni con key nueva: esperar ~1 min y consultar el hash (RPC `getTransaction`) / refrescar balances. Si `txHash` es `null` no salió nada y sí es seguro reintentar. `NETWORK_ERROR`. |
 | 500 | `INTERNAL` | `UNKNOWN`. |
 | — | fallo de red / timeout Ktor | `NETWORK_ERROR`. |
+
+El `401 UNAUTHORIZED_APP` (API key incorrecta) dejó de existir con la key, en el relayer 0.3.0: el
+mapeo que tenga la app para ese código es inofensivo, ya nunca llega.
 
 ## 3. `GET /v1/health` como feature-flag
 
@@ -79,6 +83,9 @@ Llamar al arrancar (o al entrar en el flujo admin) y cachear ~1 min:
 - Desde la 0.2.0 del relayer el JSON trae además `signer` (clave pública con la que firma el
   relayer) y `signerAuthorized` (`true` / `false` / `null`). Son diagnóstico para quien opera: la
   app no los necesita (`RelayerJson` ignora claves desconocidas) y `admin` sigue siendo la cuenta.
+- Desde la 0.3.0 `limits` trae además `faucetPerIpDaily`, `registerPerIpDaily`, `mintPerIpDaily` y
+  `vaultPerIpDaily` (cupos diarios por IP). Son enteros, como el resto: `Map<String, Int>` los
+  decodifica sin cambios en la app.
 - `/v1/health` corta la consulta a RPC/Horizon a los 8 s: la app puede usar un timeout corto
   (~10 s) SOLO para esta llamada. Existe también `GET /v1/live` (`{ ok, uptimeSeconds }`, sin red):
   es el liveness del proxy de Fly, **no** un feature-flag; la app no lo necesita.
@@ -94,8 +101,8 @@ Llamar al arrancar (o al entrar en el flujo admin) y cachear ~1 min:
   el contrato existe y, si no, responde `404 ACCOUNT_NOT_FOUND`. En el onboarding con passkey hay
   que desplegar la smart account ANTES de pedir el faucet (una C… solo derivada no recibe nada).
 - Monto: `amountStroops` como string (`"200000000"` = 20 USDC, 7 decimales). Asset en `asset`.
-- Límite: 1 por address cada 10 min y 50/día global. La app **no** tiene guard "ya fondeado":
-  gestiona el 429 con `retryAfterSeconds`.
+- Límite: 1 por address cada 10 min, 10/día por IP (desde la 0.3.0) y 50/día global. La app **no**
+  tiene guard "ya fondeado": gestiona el 429 con `retryAfterSeconds`.
 
 ## 5. Vault (`YieldViewModel.deposit()` / `withdrawAll()`)
 
@@ -111,7 +118,8 @@ Los dos consumidores del admin que el plan original no listaba:
 
 ## 6. Checklist de cierre (D1)
 
-1. `BuildConfig.RELAYER_URL` y `BuildConfig.RELAYER_APP_KEY` desde `local.properties`.
+1. `BuildConfig.RELAYER_URL` desde `local.properties`. (Hasta el relayer 0.2.0, también
+   `BuildConfig.RELAYER_APP_KEY`; desde la 0.3.0 no hay API key.)
 2. Call-sites migrados: `BecomeMerchantViewModel` (register), verificación de residente
    (mint), faucet de bienvenida (`fundContractUsdc`), `YieldViewModel` (vault).
 3. `DEMO_ADMIN_SECRET` fuera de `build.gradle.kts`; `demoAdminKeyPair()` borrado de `WalletManager`

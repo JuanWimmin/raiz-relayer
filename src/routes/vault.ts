@@ -5,10 +5,11 @@
  * Extensión fuera del SOW (pantalla Yield). Mueven fondos solo Pool ↔
  * yield_adapter, sin pérdida posible. Con `VAULT_ENDPOINTS_ENABLED=false`
  * las rutas existen pero responden 404 NOT_FOUND ("vault endpoints
- * deshabilitados") — sin exigir key, igual que cualquier ruta inexistente.
+ * deshabilitados"), igual que cualquier ruta inexistente.
  *
- * Cupo compartido entre ambas: `vaultDaily` (20/día global). Los montos
- * llegan como string decimal y salen como bigint hacia el servicio.
+ * Cupos compartidos entre ambas: `vaultDaily` (20/día global) +
+ * `vaultPerIpDaily` (20/día por IP). Los montos llegan como string decimal y
+ * salen como bigint hacia el servicio.
  */
 import type { FastifyInstance } from "fastify";
 import type { RouteContext } from "../app.js";
@@ -28,21 +29,21 @@ export function registerVaultRoutes(app: FastifyInstance, ctx: RouteContext): vo
     return;
   }
 
-  app.post(DEPOSIT_PATH, { preHandler: [ctx.auth] }, async (req) => {
+  app.post(DEPOSIT_PATH, async (req) => {
     const input = parseBody(vaultDepositBody, req.body);
     const result = await ctx.relay(req, {
       scope: "vault-deposit",
-      limits: [ctx.limits.vaultDaily()],
+      limits: [ctx.limits.vaultDaily(), ctx.limits.vaultPerIpDaily(ctx.clientIp(req))],
       run: (hooks) => ctx.service.vaultDeposit(input, hooks),
     });
     return { ok: true, txHash: result.txHash, ledger: result.ledger };
   });
 
-  app.post(REDEEM_PATH, { preHandler: [ctx.auth] }, async (req) => {
+  app.post(REDEEM_PATH, async (req) => {
     const input = parseBody(vaultRedeemBody, req.body);
     const result = await ctx.relay(req, {
       scope: "vault-redeem",
-      limits: [ctx.limits.vaultDaily()],
+      limits: [ctx.limits.vaultDaily(), ctx.limits.vaultPerIpDaily(ctx.clientIp(req))],
       run: (hooks) => ctx.service.vaultRedeem(input, hooks),
     });
     return { ok: true, txHash: result.txHash, ledger: result.ledger };

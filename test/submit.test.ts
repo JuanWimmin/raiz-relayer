@@ -19,7 +19,7 @@ import {
   type Horizon,
 } from "@stellar/stellar-sdk";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { loadConfig, redactConfig, type Config } from "../src/config.js";
+import { APP_KEY_UNUSED_WARNING, loadConfig, redactConfig, type Config } from "../src/config.js";
 import { RelayerError } from "../src/errors.js";
 import { createLogger } from "../src/logger.js";
 import { SerialQueue } from "../src/queue.js";
@@ -52,7 +52,6 @@ beforeAll(() => {
   ({ config, signerKeypair } = loadConfig({
     NETWORK: "testnet",
     RELAYER_ADMIN_SECRET: signer.secret(),
-    RELAYER_APP_KEY: "x".repeat(32),
     DEPLOYMENTS_FILE: tmpDeployments,
   }));
 });
@@ -291,7 +290,6 @@ describe("loadConfig — cuenta admin y clave que firma", () => {
   const envWith = (secret: string) => ({
     NETWORK: "testnet",
     RELAYER_ADMIN_SECRET: secret,
-    RELAYER_APP_KEY: "x".repeat(32),
     DEPLOYMENTS_FILE: tmpDeployments,
   });
 
@@ -328,12 +326,66 @@ describe("loadConfig — cuenta admin y clave que firma", () => {
     expect(() => loadConfig(withoutSecret)).toThrow(/Falta RELAYER_ADMIN_SECRET.*con la que firma el relayer/);
   });
 
-  it("redactConfig lleva las dos claves PÚBLICAS y ni rastro del secret ni de la app key", () => {
+  it("redactConfig lleva las dos claves PÚBLICAS y ni rastro del secret", () => {
     const safe = JSON.stringify(redactConfig(config));
     expect(safe).toContain(admin.publicKey());
     expect(safe).toContain(signer.publicKey());
     expect(safe).not.toContain(signer.secret());
-    expect(safe).not.toContain("x".repeat(32));
+  });
+});
+
+describe("loadConfig — sin API key (RELAYER_APP_KEY ya no se usa) y cupos por IP", () => {
+  const baseEnv = () => ({
+    NETWORK: "testnet",
+    RELAYER_ADMIN_SECRET: signer.secret(),
+    DEPLOYMENTS_FILE: tmpDeployments,
+  });
+
+  it("arranca sin RELAYER_APP_KEY (antes era obligatoria) y sin ningún aviso", () => {
+    const loaded = loadConfig(baseEnv());
+    expect(loaded.warnings).toEqual([]);
+    expect(loaded.config).not.toHaveProperty("appKey");
+  });
+
+  it("si RELAYER_APP_KEY sigue definida se ignora —valga lo que valga— y devuelve UN aviso, sin su valor", () => {
+    // Una key larga (la de un despliegue anterior), una que antes no pasaba la validación (< 16) y una vacía.
+    for (const legacy of ["k".repeat(48), "corta", ""]) {
+      const loaded = loadConfig({ ...baseEnv(), RELAYER_APP_KEY: legacy });
+      expect(loaded.warnings, legacy).toEqual([APP_KEY_UNUSED_WARNING]);
+      expect(loaded.config).not.toHaveProperty("appKey");
+      // Mismo resultado que sin la variable: no cambia nada de la configuración.
+      expect(redactConfig(loaded.config)).toEqual(redactConfig(loadConfig(baseEnv()).config));
+      if (legacy) {
+        expect(JSON.stringify(redactConfig(loaded.config))).not.toContain(legacy);
+        expect(loaded.warnings.join(" ")).not.toContain(legacy);
+      }
+    }
+    expect(APP_KEY_UNUSED_WARNING).toBe(
+      "RELAYER_APP_KEY ya no se usa: el relayer es público con cupos; puedes borrar el secret",
+    );
+  });
+
+  it("cupos diarios por IP: defaults 10 / 10 / 10 / 20, configurables por entorno y nunca < 1", () => {
+    expect(config.rates).toMatchObject({
+      faucetPerIpDaily: 10,
+      registerPerIpDaily: 10,
+      mintPerIpDaily: 10,
+      vaultPerIpDaily: 20,
+    });
+    const { rates } = loadConfig({
+      ...baseEnv(),
+      FAUCET_PER_IP_DAILY: "40",
+      REGISTER_PER_IP_DAILY: "5",
+      MINT_PER_IP_DAILY: "6",
+      VAULT_PER_IP_DAILY: "7",
+    }).config;
+    expect(rates).toMatchObject({ faucetPerIpDaily: 40, registerPerIpDaily: 5, mintPerIpDaily: 6, vaultPerIpDaily: 7 });
+    // Los globales no se mueven.
+    expect(rates).toMatchObject({ faucetDaily: 50, registerDaily: 20, mintDaily: 20, vaultDaily: 20, perIpPerMinute: 60 });
+    for (const name of ["FAUCET_PER_IP_DAILY", "REGISTER_PER_IP_DAILY", "MINT_PER_IP_DAILY", "VAULT_PER_IP_DAILY"]) {
+      expect(() => loadConfig({ ...baseEnv(), [name]: "0" }), name).toThrow(new RegExp(name));
+      expect(() => loadConfig({ ...baseEnv(), [name]: "1.5" }), name).toThrow(new RegExp(name));
+    }
   });
 });
 
@@ -341,7 +393,6 @@ describe("loadConfig — presupuesto de tiempo", () => {
   const baseEnv = () => ({
     NETWORK: "testnet",
     RELAYER_ADMIN_SECRET: signer.secret(),
-    RELAYER_APP_KEY: "x".repeat(32),
     DEPLOYMENTS_FILE: tmpDeployments,
   });
 

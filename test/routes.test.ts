@@ -2,9 +2,9 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Keypair } from "@stellar/stellar-sdk";
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyRequest } from "fastify";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { buildApp } from "../src/app.js";
+import { buildApp, clientIpKey } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
 import { RelayerError } from "../src/errors.js";
 import { createLogger } from "../src/logger.js";
@@ -13,9 +13,11 @@ import type { FaucetResult, HealthSnapshot, ServiceHooks, StellarService, Submit
 
 // ─── Config de test: admin aleatorio + deployments temporal ──────────────────
 // `admin` es la CUENTA (deployments.admin); el relayer firma con otra clave
-// (`signer`), como tras una rotación.
+// (`signer`), como tras una rotación. Sin RELAYER_APP_KEY: desde la 0.3.0 no
+// hay API key (los tests que la definen o la envían lo hacen a propósito).
 
-const TEST_KEY = "test-key-0123456789abcdef";
+/** Valor de la cabecera `x-raiz-app-key` que siguen enviando los APK 0.2.0/0.3.0. */
+const LEGACY_KEY = "legacy-app-key-0123456789abcdef";
 const admin = Keypair.random();
 const signer = Keypair.random();
 
@@ -30,7 +32,6 @@ function testEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   return {
     NETWORK: "testnet",
     RELAYER_ADMIN_SECRET: signer.secret(),
-    RELAYER_APP_KEY: TEST_KEY,
     DEPLOYMENTS_FILE: deploymentsFile,
     RATE_PER_IP_PER_MINUTE: "100000",
     ...extra,
@@ -88,14 +89,31 @@ const G_ADDR = Keypair.random().publicKey();
 const G_ADDR_2 = Keypair.random().publicKey();
 const BARRIO = "11".repeat(32);
 
+/** POST sin credenciales (así llama cualquier cliente desde la 0.3.0). */
 function post(app: FastifyInstance, url: string, payload: unknown, headers: Record<string, string> = {}) {
   return app.inject({
     method: "POST",
     url,
-    headers: { "x-raiz-app-key": TEST_KEY, ...headers },
+    headers,
     payload: payload as Record<string, unknown>,
   });
 }
+
+/** Cabecera que escribe fly-proxy con la IP del cliente: la clave de los cupos por IP. */
+const fromIp = (ip: string) => ({ "fly-client-ip": ip });
+const IP_A = "203.0.113.10";
+const IP_B = "203.0.113.11";
+const IP_C = "203.0.113.12";
+/** Dirección nueva en cada llamada: así el cupo por address del faucet no interviene. */
+const freshAddr = () => Keypair.random().publicKey();
+const merchantBody = (address: string) => ({
+  address,
+  name: "Cafe Don Aurelio",
+  barrioId: BARRIO,
+  latE6: 10421500,
+  lngE6: -75547800,
+  category: "cafe",
+});
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
@@ -133,6 +151,11 @@ describe("GET /v1/health", () => {
       registerDaily: 20,
       mintDaily: 20,
       vaultDaily: 20,
+      // Cupos diarios por IP (0.3.0), con sus defaults.
+      faucetPerIpDaily: 10,
+      registerPerIpDaily: 10,
+      mintPerIpDaily: 10,
+      vaultPerIpDaily: 20,
     });
     expect(body.vaultEndpoints).toBe(true);
     expect(body.queue).toEqual({ pending: 0 });
@@ -191,6 +214,20 @@ describe("GET /v1/health", () => {
     // `version` sale del package.json (no hay otra fuente que se pueda desfasar).
     const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
     expect(body.version).toBe(pkg.version);
+  });
+
+  it("limits: los cuatro cupos por IP siguen a la configuración y TODO el objeto son enteros (la app lo parsea como Map<String, Int>)", async () => {
+    const { app } = await makeApp(fakeService(), {
+      FAUCET_PER_IP_DAILY: "30",
+      REGISTER_PER_IP_DAILY: "3",
+      MINT_PER_IP_DAILY: "4",
+      VAULT_PER_IP_DAILY: "5",
+    });
+    const limits = (await app.inject({ method: "GET", url: "/v1/health" })).json().limits as Record<string, unknown>;
+    expect(limits).toMatchObject({ faucetPerIpDaily: 30, registerPerIpDaily: 3, mintPerIpDaily: 4, vaultPerIpDaily: 5 });
+    // Aditivo: las claves que ya leía la app siguen ahí, con sus valores.
+    expect(limits).toMatchObject({ faucetPerAddressMinutes: 10, faucetDaily: 50, registerDaily: 20, mintDaily: 20, vaultDaily: 20 });
+    for (const [key, value] of Object.entries(limits)) expect(Number.isInteger(value), key).toBe(true);
   });
 
   it("503 RPC_UNREACHABLE si service.health() lanza, y no se cachea", async () => {
@@ -348,26 +385,100 @@ describe("limitador por IP", () => {
   });
 });
 
-describe("autenticación", () => {
-  it("POST sin key → 401 UNAUTHORIZED_APP", async () => {
-    const { app } = await makeApp();
+describe("sin API key (0.3.0): el relayer es público", () => {
+  it("POST sin cabecera x-raiz-app-key → 200 (ya no existe el 401 UNAUTHORIZED_APP)", async () => {
+    const service = fakeService();
+    const { app } = await makeApp(service);
     const res = await app.inject({ method: "POST", url: "/v1/faucet", payload: { address: G_ADDR } });
-    expect(res.statusCode).toBe(401);
-    expect(res.json().error.code).toBe("UNAUTHORIZED_APP");
-    expect(res.json().ok).toBe(false);
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ ok: true, txHash: FAUCET_TX.txHash });
+    expect(service.faucet).toHaveBeenCalledTimes(1);
   });
 
-  it("key incorrecta → 401", async () => {
+  it("los cinco POST responden 200 sin ninguna credencial", async () => {
     const { app } = await makeApp();
-    const res = await post(app, "/v1/faucet", { address: G_ADDR }, { "x-raiz-app-key": "otra-key-incorrecta-123" });
-    expect(res.statusCode).toBe(401);
-    expect(res.json().error.code).toBe("UNAUTHORIZED_APP");
+    const calls: Array<[string, unknown]> = [
+      ["/v1/faucet", { address: G_ADDR }],
+      ["/v1/mint-resident", { address: G_ADDR, barrioId: BARRIO }],
+      ["/v1/register-merchant", merchantBody(G_ADDR)],
+      ["/v1/vault/deposit", { barrioId: BARRIO, amountStroops: "20000000" }],
+      ["/v1/vault/redeem", { barrioId: BARRIO, shares: "12345" }],
+    ];
+    for (const [url, body] of calls) {
+      const res = await post(app, url, body);
+      expect(res.statusCode, url).toBe(200);
+      expect(res.json().ok, url).toBe(true);
+    }
   });
 
-  it("GET /v1/health no exige key", async () => {
+  it("la cabecera heredada se ignora, valga lo que valga: los APK 0.2.0/0.3.0 la siguen enviando → 200", async () => {
+    const service = fakeService();
+    const { app } = await makeApp(service);
+    const values = [LEGACY_KEY, "otra-key-cualquiera-123", ""];
+    for (const value of values) {
+      const res = await post(app, "/v1/faucet", { address: freshAddr() }, { "x-raiz-app-key": value });
+      expect(res.statusCode, `x-raiz-app-key: "${value}"`).toBe(200);
+      expect(res.json().ok).toBe(true);
+    }
+    expect(service.faucet).toHaveBeenCalledTimes(values.length);
+  });
+
+  it("RELAYER_APP_KEY definida en el entorno no revive la autenticación: sin cabecera o con otra distinta → 200", async () => {
+    const service = fakeService();
+    const { app, config } = await makeApp(service, { RELAYER_APP_KEY: LEGACY_KEY });
+    expect(config).not.toHaveProperty("appKey");
+    expect((await post(app, "/v1/mint-resident", { address: G_ADDR, barrioId: BARRIO })).statusCode).toBe(200);
+    const other = await post(
+      app,
+      "/v1/mint-resident",
+      { address: G_ADDR_2, barrioId: BARRIO },
+      { "x-raiz-app-key": "no-es-la-del-entorno" },
+    );
+    expect(other.statusCode).toBe(200);
+    expect(service.mintResident).toHaveBeenCalledTimes(2);
+  });
+
+  it("GET /v1/health sigue sin exigir nada", async () => {
     const { app } = await makeApp();
     const res = await app.inject({ method: "GET", url: "/v1/health" });
     expect(res.statusCode).toBe(200);
+  });
+
+  it("CORS sigue cerrado: sin Access-Control-*, sin preflight, y un POST 'simple' de navegador no llega al servicio", async () => {
+    const service = fakeService();
+    const { app } = await makeApp(service);
+    const origin = { origin: "https://web-de-terceros.example" };
+
+    /* Un POST application/json desde otra web exige preflight: no hay ruta
+     * OPTIONS ni cabeceras CORS, así que el navegador nunca envía el POST. */
+    const preflight = await app.inject({
+      method: "OPTIONS",
+      url: "/v1/faucet",
+      headers: { ...origin, "access-control-request-method": "POST", "access-control-request-headers": "content-type" },
+    });
+    expect(preflight.statusCode).toBe(404);
+    expect(preflight.headers["access-control-allow-origin"]).toBeUndefined();
+
+    /* Sin preflight un navegador solo puede mandar estos tipos (o ninguno):
+     * el body no se interpreta como JSON y la request muere en la validación.
+     * Sin la key, esto es lo que impide que una web reparta peticiones entre
+     * las IP de sus visitantes. */
+    for (const contentType of ["text/plain", "application/x-www-form-urlencoded", "multipart/form-data", undefined]) {
+      const res = await app.inject({
+        method: "POST",
+        url: "/v1/faucet",
+        headers: { ...origin, ...(contentType ? { "content-type": contentType } : {}) },
+        payload: JSON.stringify({ address: G_ADDR }),
+      });
+      expect(res.statusCode, String(contentType)).toBe(400);
+      expect(res.json().error.code, String(contentType)).toBe("VALIDATION_ERROR");
+    }
+    expect(service.faucet).not.toHaveBeenCalled();
+
+    /* Y una respuesta correcta tampoco lleva cabeceras CORS. */
+    const ok = await post(app, "/v1/faucet", { address: G_ADDR }, origin);
+    expect(ok.statusCode).toBe(200);
+    expect(Object.keys(ok.headers).filter((h) => h.startsWith("access-control-"))).toEqual([]);
   });
 });
 
@@ -389,7 +500,7 @@ describe("validación y errores nativos de Fastify", () => {
     const res = await app.inject({
       method: "POST",
       url: "/v1/faucet",
-      headers: { "x-raiz-app-key": TEST_KEY, "content-type": "application/json" },
+      headers: { "content-type": "application/json" },
       payload: "{no es json",
     });
     expect(res.statusCode).toBe(400);
@@ -401,7 +512,7 @@ describe("validación y errores nativos de Fastify", () => {
     const res = await app.inject({
       method: "POST",
       url: "/v1/faucet",
-      headers: { "x-raiz-app-key": TEST_KEY, "content-type": "application/json" },
+      headers: { "content-type": "application/json" },
       payload: JSON.stringify({ address: "x".repeat(9_000) }),
     });
     expect(res.statusCode).toBe(413);
@@ -614,6 +725,208 @@ describe("POST /v1/vault/*", () => {
     const bad = await post(app, "/v1/vault/redeem", { barrioId: BARRIO, shares: "0" });
     expect(bad.statusCode).toBe(400);
     expect(bad.json().error.code).toBe("VALIDATION_ERROR");
+  });
+});
+
+describe("cupos diarios por IP (0.3.0)", () => {
+  const mintBody = () => ({ address: freshAddr(), barrioId: BARRIO });
+
+  it("faucet: se agota para una IP —429 RATE_LIMITED con Retry-After, sin llamar al servicio— y no para otra", async () => {
+    const service = fakeService();
+    const { app } = await makeApp(service, { FAUCET_PER_IP_DAILY: "2" });
+    for (let i = 0; i < 2; i++) {
+      expect((await post(app, "/v1/faucet", { address: freshAddr() }, fromIp(IP_A))).statusCode).toBe(200);
+    }
+
+    const res = await post(app, "/v1/faucet", { address: freshAddr() }, fromIp(IP_A));
+    expect(res.statusCode).toBe(429);
+    const { ok, error } = res.json();
+    expect(ok).toBe(false);
+    expect(error.code).toBe("RATE_LIMITED");
+    expect(error.retryable).toBe(true);
+    // El mensaje dice que es el cupo de ESTA red/IP, no el global.
+    expect(error.details.limit).toBe("faucet diario de esta red/IP");
+    expect(error.message).toBe(`Cupo agotado (faucet diario de esta red/IP). Reintenta en ${error.details.retryAfterSeconds} s.`);
+    // Ventana = día UTC: como mucho faltan 24 h para las 00:00.
+    expect(error.details.retryAfterSeconds).toBeGreaterThan(0);
+    expect(error.details.retryAfterSeconds).toBeLessThanOrEqual(86_400);
+    expect(res.headers["retry-after"]).toBe(String(error.details.retryAfterSeconds));
+    // 429 temprano: el servicio no se llamó la tercera vez.
+    expect(service.faucet).toHaveBeenCalledTimes(2);
+
+    // Otra IP conserva su cupo entero (2), ni más ni menos.
+    for (let i = 0; i < 2; i++) {
+      expect((await post(app, "/v1/faucet", { address: freshAddr() }, fromIp(IP_B))).statusCode).toBe(200);
+    }
+    expect((await post(app, "/v1/faucet", { address: freshAddr() }, fromIp(IP_B))).statusCode).toBe(429);
+  });
+
+  it("register-merchant, mint-resident y vault tienen cada uno su cupo por IP; deposit y redeem comparten el de vault", async () => {
+    const service = fakeService();
+    const { app } = await makeApp(service, { REGISTER_PER_IP_DAILY: "1", MINT_PER_IP_DAILY: "1", VAULT_PER_IP_DAILY: "2" });
+    const a = fromIp(IP_A);
+    const deposit = { barrioId: BARRIO, amountStroops: "20000000" };
+    const redeem = { barrioId: BARRIO, shares: "12345" };
+
+    expect((await post(app, "/v1/register-merchant", merchantBody(freshAddr()), a)).statusCode).toBe(200);
+    const reg = await post(app, "/v1/register-merchant", merchantBody(freshAddr()), a);
+    expect(reg.statusCode).toBe(429);
+    expect(reg.json().error.details.limit).toBe("registro de comercios diario de esta red/IP");
+    expect(reg.headers["retry-after"]).toBeDefined();
+
+    // El cupo de registro agotado no afecta al de mint: son contadores distintos.
+    expect((await post(app, "/v1/mint-resident", mintBody(), a)).statusCode).toBe(200);
+    const mint = await post(app, "/v1/mint-resident", mintBody(), a);
+    expect(mint.statusCode).toBe(429);
+    expect(mint.json().error.details.limit).toBe("mint de residentes diario de esta red/IP");
+    expect(mint.headers["retry-after"]).toBeDefined();
+
+    // Vault: un deposit y un redeem suman 2 en el MISMO contador.
+    expect((await post(app, "/v1/vault/deposit", deposit, a)).statusCode).toBe(200);
+    expect((await post(app, "/v1/vault/redeem", redeem, a)).statusCode).toBe(200);
+    for (const [url, body] of [
+      ["/v1/vault/deposit", deposit],
+      ["/v1/vault/redeem", redeem],
+    ] as const) {
+      const res = await post(app, url, body, a);
+      expect(res.statusCode, url).toBe(429);
+      expect(res.json().error.details.limit).toBe("operaciones de vault diarias de esta red/IP");
+      expect(res.headers["retry-after"]).toBeDefined();
+    }
+
+    // Otra IP no nota nada en ninguno de los tres grupos.
+    const b = fromIp(IP_B);
+    expect((await post(app, "/v1/register-merchant", merchantBody(freshAddr()), b)).statusCode).toBe(200);
+    expect((await post(app, "/v1/mint-resident", mintBody(), b)).statusCode).toBe(200);
+    expect((await post(app, "/v1/vault/deposit", deposit, b)).statusCode).toBe(200);
+    // Los 429 fueron tempranos: el servicio solo vio las requests admitidas.
+    expect(service.registerMerchant).toHaveBeenCalledTimes(2);
+    expect(service.mintResident).toHaveBeenCalledTimes(2);
+    expect(service.vaultDeposit).toHaveBeenCalledTimes(2);
+    expect(service.vaultRedeem).toHaveBeenCalledTimes(1);
+  });
+
+  it("un preflight fallido (422, 404) o un body inválido (400) no consumen el cupo de la IP", async () => {
+    const faucet = vi
+      .fn<StellarService["faucet"]>()
+      .mockRejectedValueOnce(new RelayerError("NO_TRUSTLINE", "sin trustline"))
+      .mockRejectedValueOnce(new RelayerError("ACCOUNT_NOT_FOUND", "no existe"))
+      .mockImplementation(okWith(FAUCET_TX));
+    const { app } = await makeApp(fakeService({ faucet }), { FAUCET_PER_IP_DAILY: "1" });
+    const a = fromIp(IP_A);
+
+    expect((await post(app, "/v1/faucet", { address: freshAddr() }, a)).statusCode).toBe(422);
+    expect((await post(app, "/v1/faucet", { address: freshAddr() }, a)).statusCode).toBe(404);
+    expect((await post(app, "/v1/faucet", { address: "hola" }, a)).statusCode).toBe(400);
+    // El cupo de 1 sigue entero: lo consume la primera que pasa el preflight…
+    expect((await post(app, "/v1/faucet", { address: freshAddr() }, a)).statusCode).toBe(200);
+    // …y la siguiente ya no cabe.
+    const res = await post(app, "/v1/faucet", { address: freshAddr() }, a);
+    expect(res.statusCode).toBe(429);
+    expect(res.json().error.details.limit).toBe("faucet diario de esta red/IP");
+    expect(faucet).toHaveBeenCalledTimes(3);
+  });
+
+  it("un submit que sale sí consume, aunque acabe en TX_TIMEOUT (igual que los cupos globales)", async () => {
+    const mintResident = vi.fn<StellarService["mintResident"]>().mockImplementation(async (_input, hooks) => {
+      hooks?.afterPreflight?.();
+      throw new RelayerError("TX_TIMEOUT", "deadline vencido con tx en vuelo", { txHash: "ef".repeat(32) });
+    });
+    const { app } = await makeApp(fakeService({ mintResident }), { MINT_PER_IP_DAILY: "1" });
+    expect((await post(app, "/v1/mint-resident", mintBody(), fromIp(IP_A))).statusCode).toBe(503);
+    expect((await post(app, "/v1/mint-resident", mintBody(), fromIp(IP_A))).statusCode).toBe(429);
+    expect(mintResident).toHaveBeenCalledTimes(1);
+  });
+
+  it("el 429 distingue el cupo de la IP del global; con los dos agotados nombra el global", async () => {
+    const { app } = await makeApp(fakeService(), { FAUCET_PER_IP_DAILY: "1", RATE_FAUCET_DAILY: "2" });
+    const faucetFrom = (ip: string) => post(app, "/v1/faucet", { address: freshAddr() }, fromIp(ip));
+    const limitedFrom = async (ip: string) => {
+      const res = await faucetFrom(ip);
+      expect(res.statusCode).toBe(429);
+      return res.json().error as { message: string; details: { limit: string } };
+    };
+
+    expect((await faucetFrom(IP_A)).statusCode).toBe(200);
+    // IP_A agotó SU cupo (1); en el global (2) aún queda sitio.
+    const perIp = await limitedFrom(IP_A);
+    expect(perIp.details.limit).toBe("faucet diario de esta red/IP");
+    expect(perIp.message).toContain("de esta red/IP");
+    expect(perIp.message).not.toContain("global");
+
+    expect((await faucetFrom(IP_B)).statusCode).toBe(200); // global: 2 de 2
+    // IP_C no ha usado nada: lo que la frena es el cupo global.
+    const global = await limitedFrom(IP_C);
+    expect(global.details.limit).toBe("faucet diario global");
+    expect(global.message).toContain("global");
+    expect(global.message).not.toContain("red/IP");
+    // IP_A tiene agotados los dos: manda el global (cambiar de red ya no serviría).
+    expect((await limitedFrom(IP_A)).details.limit).toBe("faucet diario global");
+  });
+
+  it("ventana = día UTC: Retry-After cuenta hasta las 00:00 UTC y al cambiar el día la IP recupera su cupo", async () => {
+    /* Solo se falsea Date (los timers los necesita light-my-request). La app se
+     * crea después para que el limitador lea el reloj falso. */
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(Date.UTC(2026, 9, 4, 23, 59, 0)); // 2026-10-04T23:59:00Z
+      const { app } = await makeApp(fakeService(), { MINT_PER_IP_DAILY: "1" });
+      expect((await post(app, "/v1/mint-resident", mintBody(), fromIp(IP_A))).statusCode).toBe(200);
+
+      const blocked = await post(app, "/v1/mint-resident", mintBody(), fromIp(IP_A));
+      expect(blocked.statusCode).toBe(429);
+      expect(blocked.headers["retry-after"]).toBe("60");
+      expect(blocked.json().error.details).toEqual({
+        limit: "mint de residentes diario de esta red/IP",
+        retryAfterSeconds: 60,
+      });
+
+      vi.setSystemTime(Date.UTC(2026, 9, 5, 0, 0, 0));
+      expect((await post(app, "/v1/mint-resident", mintBody(), fromIp(IP_A))).statusCode).toBe(200);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("sin Fly-Client-IP (local, tests) todas las requests comparten una clave estable: la IP del socket", async () => {
+    const { app } = await makeApp(fakeService(), { MINT_PER_IP_DAILY: "1" });
+    const mint = (headers: Record<string, string> = {}) => post(app, "/v1/mint-resident", mintBody(), headers);
+
+    expect((await mint()).statusCode).toBe(200);
+    // Misma clave (127.0.0.1 en inject), no un cubo nuevo por request…
+    expect((await mint()).statusCode).toBe(429);
+    // …ni rellenando X-Forwarded-For, que escribe el cliente.
+    expect((await mint({ "x-forwarded-for": "198.51.100.77" })).statusCode).toBe(429);
+    // Es la MISMA clave que la del limitador por minuto: Fly-Client-IP con esa IP cae en el mismo cubo.
+    expect((await mint(fromIp("127.0.0.1"))).statusCode).toBe(429);
+    expect((await mint(fromIp(IP_B))).statusCode).toBe(200);
+  });
+
+  it("clientIpKey: sin IP resoluble la clave es fija ('unknown'); Fly-Client-IP manda sobre el socket; IPv6 se agrupa por /64", () => {
+    const req = (headers: Record<string, string>, remoteAddress?: string) =>
+      ({ headers, socket: { remoteAddress } }) as unknown as FastifyRequest;
+
+    expect(clientIpKey(req({}))).toBe("unknown");
+    expect(clientIpKey(req({ "fly-client-ip": "   " }))).toBe("unknown");
+    expect(clientIpKey(req({}, "10.0.0.1"))).toBe("10.0.0.1");
+    expect(clientIpKey(req({ "fly-client-ip": " 203.0.113.10 " }, "10.0.0.1"))).toBe("203.0.113.10");
+    // Un cliente IPv6 no tiene 2^64 cubos: dos direcciones del mismo /64 son la misma clave.
+    const v6 = (ip: string) => clientIpKey(req({ "fly-client-ip": ip }));
+    expect(v6("2001:db8:1:2:aaaa::1")).toBe(v6("2001:db8:1:2:bbbb::2"));
+    expect(v6("2001:db8:1:3::1")).not.toBe(v6("2001:db8:1:2::1"));
+  });
+
+  it("repetir con la misma idempotency-key no gasta otra unidad del cupo de la IP", async () => {
+    const service = fakeService();
+    const { app } = await makeApp(service, { MINT_PER_IP_DAILY: "2" });
+    const body = { address: G_ADDR, barrioId: BARRIO };
+    const headers = { ...fromIp(IP_A), "idempotency-key": "k-ip-1" };
+    for (let i = 0; i < 3; i++) expect((await post(app, "/v1/mint-resident", body, headers)).statusCode).toBe(200);
+    expect(service.mintResident).toHaveBeenCalledTimes(1);
+
+    // Solo se consumió 1 de 2: cabe una operación nueva, y la siguiente ya no.
+    expect((await post(app, "/v1/mint-resident", mintBody(), fromIp(IP_A))).statusCode).toBe(200);
+    expect((await post(app, "/v1/mint-resident", mintBody(), fromIp(IP_A))).statusCode).toBe(429);
   });
 });
 

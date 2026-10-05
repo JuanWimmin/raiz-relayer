@@ -2,10 +2,11 @@
  * Integración REAL contra Stellar testnet. Solo corre con RELAYER_IT=1 y una
  * configuración válida en el entorno (RELAYER_ADMIN_SECRET = la clave con la
  * que firma el relayer, un firmante vigente de la cuenta admin; la cuenta
- * sigue siendo `deployments.admin`; RELAYER_APP_KEY, NETWORK=testnet):
+ * sigue siendo `deployments.admin`; NETWORK=testnet). Sin API key: desde la
+ * 0.3.0 los POST no llevan credenciales.
  *
  *   RELAYER_IT=1 RELAYER_ADMIN_SECRET=$(stellar keys show raiz-admin-signer) \
- *   RELAYER_APP_KEY=test-key-0123456789abcdef npx vitest run test/integration
+ *   npx vitest run test/integration
  *
  * Mueve USDC de verdad (de testnet) desde la cuenta admin: 1 faucet de 20 USDC
  * a una G… fresca y, solo si se define RELAYER_IT_SMART_ACCOUNT (un C…
@@ -64,7 +65,6 @@ describeIt("relayer contra testnet (RELAYER_IT=1)", () => {
   let app: FastifyInstance;
   let config: Config;
   let horizon: Horizon.Server;
-  const appKey = process.env.RELAYER_APP_KEY ?? "";
   const evidence: Evidence = { ranAt: new Date().toISOString(), network: "testnet", admin: "", signer: "", txs: {}, checks: {} };
 
   // Cuentas de prueba frescas (no se persisten: cada run usa unas nuevas).
@@ -73,7 +73,7 @@ describeIt("relayer contra testnet (RELAYER_IT=1)", () => {
   const missingContract = StrKey.encodeContract(randomBytes(32)); // C… válido como strkey pero sin desplegar
 
   const post = async (url: string, body: unknown, headers: Record<string, string> = {}): Promise<InjectResponse> =>
-    app.inject({ method: "POST", url, payload: body as Record<string, unknown>, headers: { "x-raiz-app-key": appKey, ...headers } });
+    app.inject({ method: "POST", url, payload: body as Record<string, unknown>, headers });
 
   const expert = (hash: string) => `https://stellar.expert/explorer/testnet/tx/${hash}`;
   const record = (name: string, body: { txHash: string; ledger: number }) => {

@@ -7,10 +7,15 @@ USDC y movimientos del vault — para que el **APK release ya no lleve la clave 
 Es el entregable **D1 "Admin Relayer"** del SOW con Instaward. Solo funciona contra **testnet** y
 se niega a arrancar con cualquier otra red.
 
+Es un **servicio público de testnet**, como friendbot: no pide credenciales (desde la 0.3.0 no hay
+API key) y lo que acota el abuso son **cupos del lado del servidor** (ver
+[Límites y cupos](#límites-y-cupos)).
+
 > **Sucesor previsto:** este relayer es un puente pragmático. En la fase **F3 (custodia comunal)**
 > del roadmap la autoridad admin pasa a un esquema multisig/comunitario y este servicio deja de ser
 > necesario. Nada de lo que hay aquí pretende ser seguridad de mainnet (ver
-> [Modelo de amenazas](#modelo-de-amenazas-testnet-honesto)).
+> [Modelo de amenazas](#modelo-de-amenazas-testnet-honesto) y
+> [Camino a mainnet](#camino-a-mainnet-autenticación-por-wallet)).
 
 ---
 
@@ -24,7 +29,7 @@ Hasta la v0.1 de la app, los flujos que exigen `admin.require_auth()` en los con
 Con el relayer:
 
 - la clave que firma por el admin vive **solo** en la variable de entorno `RELAYER_ADMIN_SECRET` del servidor;
-- la app llama a un endpoint JSON con una API key estática y recibe el `txHash`;
+- la app llama a un endpoint JSON, sin ninguna credencial, y recibe el `txHash`;
 - el APK release se verifica sin secretos (`grep -rE "S[A-Z0-9]{55}"` = 0).
 
 **Cuenta admin ≠ clave que firma.** La *cuenta* admin es la `G…` de `deployments.admin`
@@ -36,15 +41,15 @@ firmante (`GB42NCO6…`): la maestra —la que viajó en el APK 0.1.0— tiene p
 ## Arquitectura en 10 líneas
 
 1. **Node 22 + TypeScript ESM**, **Fastify 5**, **`@stellar/stellar-sdk` 17** (RPC + Horizon), zod, pino.
-2. `GET /v1/live` y `GET /v1/health` públicos; los `POST` exigen el header `x-raiz-app-key` (comparación en tiempo constante).
+2. **Sin autenticación**: `GET /v1/live`, `GET /v1/health` y los `POST` son públicos (desde la 0.3.0 no hay API key). El abuso se acota con los cupos del punto 4, no con credenciales.
 3. Validación zod estricta de bodies (≤ 8 KB) → **preflights** (existencia de cuenta/contrato, trustline, `get_merchant`, balance del admin).
-4. **Rate-limits en memoria**: por IP (60/min, clave `Fly-Client-IP`), por address (faucet 1/10 min) y cupos diarios UTC por endpoint.
+4. **Rate-limits en memoria**: por IP y minuto (60/min, clave `Fly-Client-IP`), por IP y día en cada `POST`, por address (faucet 1/10 min) y cupos diarios UTC globales por endpoint.
 5. **Cola serializada** (`SerialQueue`): una transacción a la vez porque hay **una** cuenta admin = **un** sequence number.
 6. Pipeline único `submit()`: simulate → assemble → sign → send → poll, con deadline de 70 s (y 15 s por request al RPC), reintentos ante propagación RPC y **política anti doble gasto** (máx. 1 rebuild, solo si la tx anterior es `NOT_FOUND` y su `maxTime` venció).
 7. **Allowlist de 6 contratos** (`pool, governance, treasury, rewards, yield_adapter, usdc_sac` de `config/deployments.testnet.json`); cualquier otro `contractId` se rechaza.
 8. Errores de contrato **atribuidos al contrato que falló** (eventos de diagnóstico), porque los códigos numéricos colisionan entre Pool, Governance, adapter y SAC.
 9. `idempotency-key` opcional → misma respuesta durante 10 min; peticiones concurrentes comparten la promesa. Un `TX_TIMEOUT` con `txHash` también se cachea (reintentar con la misma key devuelve el mismo hash y **no re-firma**).
-10. Logs pino con `redact` (secret, `x-raiz-app-key`, `authorization`); `sim.error` crudo solo en `debug`.
+10. Logs pino con `redact` (secret, `authorization` y la cabecera `x-raiz-app-key` que aún envían los APK antiguos); `sim.error` crudo solo en `debug`.
 
 ---
 
@@ -52,9 +57,10 @@ firmante (`GB42NCO6…`): la maestra —la que viajó en el APK 0.1.0— tiene p
 
 Base: `/v1`. Todos JSON (`content-type: application/json`), body ≤ 8 KB.
 
-**Auth:** header `x-raiz-app-key: <RELAYER_APP_KEY>` en todos los POST (401 si falta o no coincide).
-`GET /v1/live` y `GET /v1/health` son públicos (pero están bajo el limitador por IP, igual que
-las rutas inexistentes: un 404 también cuenta).
+**Sin autenticación:** ningún endpoint pide credenciales (no hay API key ni existe ya el `401`).
+Todas las rutas —también `GET /v1/live`, `GET /v1/health` y las inexistentes: un 404 cuenta— están
+bajo el limitador por IP y minuto, y cada `POST` tiene además sus [cupos](#límites-y-cupos): por IP
+y día, por address (faucet) y globales por día.
 
 **Idempotencia (opcional):** header `idempotency-key` (≤ 64 chars) → la misma respuesta durante
 10 min; misma key con body distinto → `422 IDEMPOTENCY_MISMATCH`; peticiones concurrentes con la
@@ -83,7 +89,6 @@ antes de enviar nada) no se cachea y sí es seguro reintentar.
 | HTTP | `error.code` | Cuándo |
 |---|---|---|
 | 400 | `VALIDATION_ERROR` | body inválido (`details` con el campo) |
-| 401 | `UNAUTHORIZED_APP` | falta/incorrecta `x-raiz-app-key` |
 | 404 | `BARRIO_NOT_FOUND` | Pool #6 |
 | 404 | `BARRIO_ADMIN_NOT_SET` | Governance #4 |
 | 404 | `ACCOUNT_NOT_FOUND` | faucet a G… sin crear (Horizon 404 / SAC #6) → "usa friendbot primero"; faucet a C… cuyo contrato no está desplegado |
@@ -95,7 +100,7 @@ antes de enviar nada) no se cachea y sí es seguro reintentar.
 | 422 | `TRUSTLINE_DEAUTHORIZED` | SAC #11 |
 | 422 | `IDEMPOTENCY_MISMATCH` | misma `idempotency-key`, body distinto |
 | 422 | `CONTRACT_ERROR` | otro error de contrato; `details.contract`, `details.contractCode`, `details.name?` |
-| 429 | `RATE_LIMITED` | `details.retryAfterSeconds` + header **`Retry-After`** |
+| 429 | `RATE_LIMITED` | `details.retryAfterSeconds` + header **`Retry-After`**. En los cupos de los `POST`, `details.limit` (y el mensaje) dicen cuál se agotó: `… de esta red/IP` (el diario de tu IP), `… global` (el diario de todos) o `faucet por address` |
 | 502 | `UNAUTHORIZED_ADMIN` | El relayer no puede actuar como admin (mal configurado): #3 en Pool/Governance/adapter, o la red rechaza su firma (`txBadAuth` / `opBadAuth`) porque la clave de `RELAYER_ADMIN_SECRET` no está autorizada para firmar por la cuenta admin (`details.txResult`, `details.admin`, `details.signer`) → [rotación](#runbook-rotación-de-la-clave-del-admin) |
 | 502 | `TX_FAILED` | tx aplicada con fallo; `details.txResult` |
 | 503 | `FAUCET_EMPTY` | balance USDC del admin < monto → [runbook](#runbook-re-fondear-el-faucet) |
@@ -124,8 +129,9 @@ Es lo que sondean el `[[http_service.checks]]` de `fly.toml` y el `HEALTHCHECK` 
       "signer": "GB42NCO6…", "signerAuthorized": true,
       "contracts": { "pool": "…", "governance": "…", "treasury": "…", "rewards": "…", "yield_adapter": "…", "usdc_sac": "…" },
       "faucet": { "enabled": true, "amountStroops": "200000000", "adminUsdcStroops": "3412750000", "remainingToday": 50 },
-      "limits": { "faucetPerAddressMinutes": 10, "faucetDaily": 50, "registerDaily": 20, "mintDaily": 20, "vaultDaily": 20 },
-      "vaultEndpoints": true, "queue": { "pending": 0 }, "version": "0.2.0", "uptimeSeconds": 123 }
+      "limits": { "faucetPerAddressMinutes": 10, "faucetDaily": 50, "registerDaily": 20, "mintDaily": 20, "vaultDaily": 20,
+                  "faucetPerIpDaily": 10, "registerPerIpDaily": 10, "mintPerIpDaily": 10, "vaultPerIpDaily": 20 },
+      "vaultEndpoints": true, "queue": { "pending": 0 }, "version": "0.3.0", "uptimeSeconds": 123 }
 503 { "ok": false, "error": { "code": "RPC_UNREACHABLE", … } }
 ```
 
@@ -133,6 +139,11 @@ Es lo que sondean el `[[http_service.checks]]` de `fly.toml` y el `HEALTHCHECK` 
 `vaultEndpoints` para mostrar u ocultar botones. Devuelve **503 `RPC_UNREACHABLE` cuando RPC/Horizon
 fallan o tardan más de 8 s** (el error no se cachea; el siguiente GET reintenta). Por eso el proxy
 NO sondea esta ruta: una caída de Stellar debe verse como `ok:false`, no como "relayer muerto".
+
+`limits` son los cupos configurados (no lo que queda): los cuatro `*PerIpDaily` —desde la 0.3.0—
+son los diarios por IP. Todos sus valores son **enteros**, y así deben seguir: la app los lee como
+`Map<String, Int>` (admite claves nuevas, no otros tipos). `faucet.remainingToday` es lo que queda
+hoy del cupo **global** del faucet.
 
 **Quién firma** (para quien opera; la app no usa estos campos): `admin` es la **cuenta** admin
 (`deployments.admin`: origen de las transacciones y dueña del USDC del faucet). `signer` es la
@@ -168,7 +179,7 @@ req  { "address": "G…|C…", "name": "Cafe Don Aurelio" /* 2..40 */, "barrioId
 
 `verified = true` se fija server-side (como hacía la app). El contrato sobrescribe sin comprobar
 existencia, por eso el preflight `get_merchant` devuelve `409` (re-registrar = intervención manual
-del admin). Cupo: 20/día.
+del admin). Cupo: 10/día por IP · 20/día global.
 
 ### `POST /v1/mint-resident` → `Governance.mint_resident(barrio_admin, resident, barrio_id)`
 
@@ -179,7 +190,7 @@ req  { "address": "G…|C…", "barrioId": "<hex64>" }
 ```
 
 El relayer actúa como `barrio_admin = GBLS7PL5…` (la cuenta admin; el seed la configura como admin
-de los 3 barrios). Soulbound: nunca hay `transfer`. Cupo: 20/día.
+de los 3 barrios). Soulbound: nunca hay `transfer`. Cupo: 10/día por IP · 20/día global.
 
 ### `POST /v1/faucet` → 20 USDC de Blend (`FAUCET_AMOUNT_STROOPS`)
 
@@ -196,7 +207,7 @@ req  { "address": "G…|C…" }
   ACCOUNT_NOT_FOUND`). Una C… derivada pero aún no desplegada no recibe faucet: la app debe
   desplegar la smart account primero.
 
-Cupo: 1 por address cada 10 min · 50/día global.
+Cupo: 1 por address cada 10 min · 10/día por IP · 50/día global.
 
 ### `POST /v1/vault/deposit` y `POST /v1/vault/redeem` (extensión fuera del SOW)
 
@@ -215,7 +226,7 @@ redeem  req { "barrioId": "<hex64>", "shares": "12345" }            → Pool.red
 ```
 
 Montos como **string decimal** (i128, stroops con 7 decimales). Solo mueven fondos Pool ↔ adapter
-(sin pérdida posible). Cupo: 20/día.
+(sin pérdida posible). Cupo (deposit + redeem juntos): 20/día por IP · 20/día global.
 
 ---
 
@@ -227,7 +238,13 @@ Copia `.env.example` a `.env`. Obligatorias:
 |---|---|
 | `NETWORK` | Debe ser exactamente `testnet`. Cualquier otro valor → el proceso no arranca. |
 | `RELAYER_ADMIN_SECRET` | Clave `S…` con la que firma el relayer: la maestra de la cuenta admin o un firmante autorizado de ella. La **cuenta** es siempre `deployments.admin` (`GBLS7PL5…`) y no depende de esta variable. Si la clave no puede firmar por esa cuenta, el proceso no arranca ([verificación on-chain](#verificación-del-firmante-al-arrancar)). Nunca al repo ni a logs. |
-| `RELAYER_APP_KEY` | API key estática que envía la app en `x-raiz-app-key` (≥ 16 chars). `openssl rand -hex 24`. |
+
+`RELAYER_APP_KEY` **ya no existe** (0.3.0). Si sigue definida —el secret de un despliegue anterior—
+se ignora, sin validarla, y el arranque escribe un único `warn`:
+
+```
+RELAYER_APP_KEY ya no se usa: el relayer es público con cupos; puedes borrar el secret
+```
 
 Opcionales (default entre paréntesis):
 
@@ -243,6 +260,10 @@ Opcionales (default entre paréntesis):
 | `RATE_MINT_DAILY` | `20` | Cupo diario de `mint-resident` |
 | `RATE_VAULT_DAILY` | `20` | Cupo diario conjunto de `vault/*` |
 | `RATE_PER_IP_PER_MINUTE` | `60` | Limitador por IP. Clave = header `Fly-Client-IP` (lo escribe fly-proxy; **no** `X-Forwarded-For`, que el cliente puede rellenar), o la IP del socket si no viene. Cubre también los 404 |
+| `FAUCET_PER_IP_DAILY` | `10` | Cupo diario **por IP** del faucet (misma clave de IP que el limitador por minuto) |
+| `REGISTER_PER_IP_DAILY` | `10` | Cupo diario por IP de `register-merchant` |
+| `MINT_PER_IP_DAILY` | `10` | Cupo diario por IP de `mint-resident` |
+| `VAULT_PER_IP_DAILY` | `20` | Cupo diario por IP conjunto de `vault/*` (deposit + redeem) |
 | `VAULT_ENDPOINTS_ENABLED` | `true` | `false` → `/v1/vault/*` responde 404 |
 | `LOG_LEVEL` | `info` | pino (`fatal…trace`, `silent`) |
 | `DEPLOYMENTS_FILE` | `config/deployments.testnet.json` | Copia literal del `deployments.json` del monorepo |
@@ -293,18 +314,22 @@ clave **maestra**, que desde la rotación tiene peso 0 y ya no sirve para firmar
 git clone https://github.com/JuanWimmin/raiz-relayer && cd raiz-relayer
 npm ci
 cp .env.example .env
-# Edita .env: RELAYER_APP_KEY=$(openssl rand -hex 24) y el secret desde la CLI (no lo pegues a mano):
+# El secret, desde la CLI (no lo pegues a mano en .env):
 export RELAYER_ADMIN_SECRET=$(stellar keys show raiz-admin-signer)
 npm run dev                # tsx watch src/index.ts
 curl -s http://localhost:8080/v1/health | jq .      # signerAuthorized: true
 ```
 
-Prueba de humo de todos los endpoints contra un relayer vivo:
+Prueba de humo de todos los endpoints contra un relayer vivo (no necesita ninguna credencial):
 
 ```bash
-RELAYER_APP_KEY=… ./scripts/smoke.sh                      # local
-RELAYER_URL=https://raiz-relayer.fly.dev RELAYER_APP_KEY=… ./scripts/smoke.sh
+./scripts/smoke.sh                                            # local
+RELAYER_URL=https://raiz-relayer.fly.dev ./scripts/smoke.sh   # desplegado
 ```
+
+Con los valores de ejemplo no se firma nada, pero cada pasada gasta algo de cupo, el de tu IP y el
+global: 1 de mint, 1 de registro y 2 de vault (se rechazan al simular; ver
+[Límites y cupos](#límites-y-cupos)).
 
 ## Tests
 
@@ -317,7 +342,6 @@ Integración real contra testnet (firma transacciones de verdad y consume cupos)
 
 ```bash
 export RELAYER_ADMIN_SECRET=$(stellar keys show raiz-admin-signer)
-export RELAYER_APP_KEY=cualquier-cosa-de-16-chars
 RELAYER_IT=1 npm run test:it
 ```
 
@@ -333,8 +357,7 @@ Timeout por test: 180 s.
 ```bash
 docker build -t raiz-relayer .
 docker run --rm -p 8080:8080 -e NETWORK=testnet \
-  -e RELAYER_ADMIN_SECRET="$(stellar keys show raiz-admin-signer)" \
-  -e RELAYER_APP_KEY="$RELAYER_APP_KEY" raiz-relayer
+  -e RELAYER_ADMIN_SECRET="$(stellar keys show raiz-admin-signer)" raiz-relayer
 ```
 
 Fly.io (región `iad` — Ashburn; `bog` y `mia` están deprecadas en Fly y no admiten máquinas nuevas — `fly.toml` incluido):
@@ -342,14 +365,27 @@ Fly.io (región `iad` — Ashburn; `bog` y `mia` están deprecadas en Fly y no a
 ```bash
 fly launch --no-deploy            # usa el fly.toml existente; no crees Postgres ni Redis
 fly secrets set NETWORK=testnet \
-  RELAYER_ADMIN_SECRET="$(stellar keys show raiz-admin-signer)" \
-  RELAYER_APP_KEY="$(openssl rand -hex 24)"
+  RELAYER_ADMIN_SECRET="$(stellar keys show raiz-admin-signer)"
 fly deploy --ha=false             # ← SIEMPRE con --ha=false
 ```
 
 `raiz-admin-signer` es la identidad del firmante vigente de la cuenta admin (la cuenta sigue siendo
 la de `deployments.admin`). Si el secret no puede firmar por esa cuenta la máquina no arranca: mira
 `fly logs` (línea `fatal` con el motivo) y el [runbook de rotación](#runbook-rotación-de-la-clave-del-admin).
+
+**Al pasar de la 0.2.0 a la 0.3.0** el secret `RELAYER_APP_KEY` deja de usarse. El orden importa:
+
+1. Despliega la 0.3.0 (`fly deploy --ha=false`) **sin tocar el secret** y comprueba `version: "0.3.0"`
+   en `/v1/health`. Mientras siga definido, el relayer lo ignora y escribe un `warn` en cada arranque.
+2. Solo cuando des la 0.3.0 por buena, bórralo: `fly secrets unset RELAYER_APP_KEY` (Fly reinicia la
+   máquina y los contadores en memoria vuelven a cero).
+
+Al revés no: la 0.2.0 exige ese secret y no arranca sin él, así que borrarlo con ella en marcha —o
+volver a ella después de borrarlo— deja la máquina en crash-loop. Para una vuelta atrás hay que
+reponerlo con el **mismo valor** que llevan los APK publicados.
+
+Los cupos por IP se cambian sin tocar código, como cualquier otra variable (`[env]` de `fly.toml` o
+`fly secrets set FAUCET_PER_IP_DAILY=40`): ver [Límites y cupos](#límites-y-cupos).
 
 **Por qué una sola máquina:** el relayer mantiene **una cola serializada por cuenta admin**. Hay una
 única cuenta admin y, por tanto, un único sequence number en la red. Con dos máquinas cada una
@@ -377,50 +413,103 @@ flujo admin. El `HEALTHCHECK` del Dockerfile sigue el mismo criterio.
 |---|---|---|
 | Cualquier ruta (incluidos 404 y `/v1/live`) | 60 req/min | por IP (`Fly-Client-IP`; nunca `X-Forwarded-For`) |
 | `POST /v1/faucet` | 1 cada 10 min | por `address` |
+| `POST /v1/faucet` | 10/día (UTC) | por IP |
 | `POST /v1/faucet` | 50/día (UTC) | global |
+| `POST /v1/register-merchant` | 10/día (UTC) | por IP |
 | `POST /v1/register-merchant` | 20/día (UTC) | global |
+| `POST /v1/mint-resident` | 10/día (UTC) | por IP |
 | `POST /v1/mint-resident` | 20/día (UTC) | global |
+| `POST /v1/vault/*` | 20/día (UTC) conjunto | por IP |
 | `POST /v1/vault/*` | 20/día (UTC) conjunto | global |
 | Cola | 20 jobs en espera | global (`503 QUEUE_FULL`) |
 | Body | 8 KB | por request |
 
+Todos son configurables por entorno ([variables](#variables-de-entorno)); los de la tabla son los
+valores por defecto.
+
 Aclaraciones:
 
+- **Cupos por IP (desde la 0.3.0).** Como ya no hay API key, cualquiera puede llamar; sin ellos una
+  sola IP podría agotar el cupo global del día y dejar sin servicio a los demás. Usan la misma clave
+  que el limitador por minuto (`Fly-Client-IP`, IPv6 agrupado por /64) y la misma ventana que los
+  globales (día UTC). El `429` dice cuál se agotó: `Cupo agotado (faucet diario de esta red/IP)…`
+  frente a `Cupo agotado (faucet diario global)…` (el nombre va también en `details.limit`). Con
+  los dos agotados se nombra el global: cambiar de red ya no serviría.
+- **Eventos y redes compartidas.** Todos los teléfonos que salen por la misma IP pública —el wifi
+  de un evento, la NAT de una operadora— comparten el cupo por IP. Antes de una demo con muchos
+  dispositivos en la misma red, súbelo (`FAUCET_PER_IP_DAILY`, `MINT_PER_IP_DAILY`,
+  `REGISTER_PER_IP_DAILY`, `VAULT_PER_IP_DAILY`) y, si hace falta, también el global.
+- **Vault:** por defecto el cupo por IP (20) es igual al global (20), así que ahí una sola IP sí
+  puede gastar el cupo del día. Baja `VAULT_PER_IP_DAILY` si quieres el mismo reparto que en los
+  demás.
 - El SOW dice "20/día global" para register/mint; se implementa como **20 por endpoint**
   (contadores independientes), que es la lectura más útil operativamente.
 - Los contadores viven **en memoria**: se reinician con cada redeploy/reinicio (y el día cambia a
   las 00:00 UTC). No hay persistencia a propósito (testnet, una máquina).
-- El cupo se **consume después de la validación y los preflights, y antes del envío**: un `400`,
-  `404`, `409` o `422` no quema cupo; un `TX_TIMEOUT` sí (la tx puede aplicarse después y no
-  debe poder repetirse gratis).
+- Los cupos de una petición (por address, por IP y global) se **consumen juntos, después de la
+  validación y los preflights y justo antes de entrar en la cola de envío**. Lo que se detecta antes
+  no quema cupo: un `400` y los errores de preflight (`ACCOUNT_NOT_FOUND`, `NO_TRUSTLINE`,
+  `TRUSTLINE_DEAUTHORIZED` y `FAUCET_EMPTY` en el faucet; `MERCHANT_EXISTS` en el registro). Lo que
+  solo aparece al simular la transacción —ya dentro del envío— **sí** lo consume: `ALREADY_RESIDENT`
+  y `BARRIO_ADMIN_NOT_SET` (mint), `BARRIO_NOT_FOUND`, los `CONTRACT_ERROR` del vault; y también un
+  `TX_TIMEOUT` (la tx puede aplicarse después y no debe poder repetirse gratis).
 
 ---
 
 ## Modelo de amenazas (testnet, honesto)
 
 Este servicio protege **una cosa**: que la clave admin no viaje en el APK. Todo lo demás son
-mitigaciones de abuso, no autenticación.
+mitigaciones de abuso, no autenticación. Desde la 0.3.0 es, sin disimulo, un **servicio público de
+testnet**, como friendbot: no sabe quién llama ni comprueba que sea dueño de la dirección que envía.
 
-- **La API key viaja en el APK y es extraíble.** `x-raiz-app-key` limita el abuso casual
-  (bots, curiosos) y permite rotarla; **no autentica** a nadie. Cualquiera que descompile el APK
-  tiene la key.
-- **No hay prueba de propiedad del `address`.** Quien tenga la key puede pedir `mint-resident`
-  o `register-merchant` para **cualquier dirección**, o el faucet hacia cualquier cuenta.
-  Mitigaciones: `ALREADY_RESIDENT` (un soulbound por address, nunca se re-mintea),
-  `MERCHANT_EXISTS` (no se sobrescribe un comercio), cupos diarios, ventana por address del
-  faucet y allowlist de contratos. **Lo que NO cubre:** que un tercero registre como comercio o
-  residente una dirección ajena antes que su dueño, o vacíe el cupo diario de faucet/mint a
-  propósito (denegación de servicio barata). En testnet el impacto es demo rota, no dinero.
-- **La ventana por address del faucet también protege a las `C…`.** Antes bastaba con derivar
-  direcciones de contrato (gratis, sin tocar la red) para rotar destinos y vaciar el cupo diario;
-  ahora el faucet a `C…` exige que el contrato **exista en la red** (`404 ACCOUNT_NOT_FOUND` si
-  no), y desplegar una smart account cuesta XLM y una transacción por dirección. Para `G…` la
-  barrera equivalente es friendbot (cuenta creada en la red).
-- **El limitador por IP no se evade con `X-Forwarded-For`.** La clave del cubo es el header
-  `Fly-Client-IP`, que escribe fly-proxy en cada request y el cliente no puede fijar desde fuera;
-  `trustProxy` es una función que solo confía en el proxy de Fly (`fdaa::/16`) y loopback, así que
-  `req.ip` (y el `remoteAddress` de los logs) tampoco se envenena rellenando `X-Forwarded-For`.
-  Los 404 pasan por el mismo cubo. Sigue siendo por IP: una NAT grande comparte los 60/min.
+### Qué puede hacer cualquiera
+
+Cualquiera con `curl` —no hace falta la app— puede pedir al relayer que firme como admin, dentro de
+los cupos:
+
+- **Pedir el faucet**: 20 USDC de testnet para cualquier cuenta `G…` que exista y tenga trustline, o
+  para cualquier smart account `C…` desplegada.
+- **Registrar un comercio**: cualquier dirección, en cualquier barrio, con el nombre, la categoría y
+  las coordenadas que quiera; queda `verified = true`. Lo que no puede es sobrescribir uno que ya
+  existe (`MERCHANT_EXISTS`).
+- **Acuñar un residente**: dar a cualquier dirección el soulbound de cualquier barrio. El KYC es un
+  **mock declarado** —nadie comprueba que esa persona viva ahí— y un residente vota: quien acuñe
+  direcciones propias altera el quórum y suma votos sobre el fondo del barrio.
+- **Mover el fondo ocioso** de un barrio entre líquido y Blend (`vault/deposit`, `vault/redeem`),
+  siempre dentro del colchón que impone el contrato. No puede sacarlo del protocolo.
+
+Tampoco hay prueba de propiedad del `address`: un tercero puede registrar como comercio o como
+residente una dirección ajena antes que su dueño. En testnet el daño posible es una demo rota y
+datos basura on-chain, no dinero.
+
+### Qué lo acota
+
+- **Cupos del lado del servidor** ([tabla](#límites-y-cupos)):
+  - por IP y minuto: 60, en cualquier ruta (los 404 también cuentan);
+  - por IP y día en cada `POST`: faucet 10, registro 10, mint 10, vault 20. Una sola IP ya no puede
+    agotar el cupo global de faucet, registro ni mint;
+  - por dirección: 1 faucet cada 10 min, un soulbound por dirección y para siempre
+    (`ALREADY_RESIDENT`, nunca se re-mintea) y un comercio por dirección (`MERCHANT_EXISTS`);
+  - globales por día: faucet 50, registro 20, mint 20, vault 20. Son el techo de lo que el relayer
+    firma en un día, lo pida quien lo pida: 1 000 USDC de faucet, 20 comercios, 20 residentes.
+- **La clave de IP no la elige el cliente.** Es el header `Fly-Client-IP`, que escribe fly-proxy en
+  cada request y el cliente no puede fijar desde fuera; `trustProxy` es una función que solo confía
+  en el proxy de Fly (`fdaa::/16`) y loopback, así que `req.ip` (y el `remoteAddress` de los logs)
+  tampoco se envenena rellenando `X-Forwarded-For`. IPv6 se agrupa por /64.
+- **El faucet exige que el destino exista en la red.** Una `G…` tiene que estar creada (friendbot)
+  y con trustline; una `C…` tiene que estar **desplegada** (`404 ACCOUNT_NOT_FOUND` si no). Derivar
+  direcciones de contrato es gratis; desplegarlas cuesta XLM y una transacción por dirección, así
+  que no sirven para rotar destinos y saltarse la ventana por address.
+- **Lista blanca de 6 contratos** (los 5 de RAÍZ + el SAC de USDC que exige el faucet; el SOW
+  decía "5", la desviación es esta): `submit()` rechaza cualquier otro `contractId`. El relayer no
+  es un firmante genérico: solo construye las operaciones de arriba, con argumentos validados (zod
+  estricto, body ≤ 8 KB) y `verified` / `admin` fijados por el servidor.
+- **Sin CORS, y solo JSON.** No se emiten cabeceras `Access-Control-*` ni se responde al preflight,
+  y un body solo se interpreta si llega como `application/json`, el tipo que obliga al navegador a
+  hacer ese preflight. Una web de terceros no puede usar los navegadores de sus visitantes para
+  repartir peticiones entre muchas IP. La app nativa no necesita CORS.
+- **Anti doble gasto** en el pipeline: reenviar el mismo envelope siempre es seguro; solo se
+  reconstruye con secuencia nueva si la tx anterior es `NOT_FOUND` y su `maxTime` venció.
 - **La clave que firma solo está en env** (`RELAYER_ADMIN_SECRET`); al arrancar el proceso
   verifica on-chain que esa clave puede firmar por la cuenta admin (`deployments.admin`) y se niega
   a arrancar si no; pino redacta secret y headers; el `sim.error` crudo solo en `debug`.
@@ -432,23 +521,62 @@ mitigaciones de abuso, no autenticación.
   un APK. La rotación corta el acceso de ahí en adelante; no deshace lo que se hubiera firmado con
   la clave vieja mientras fue válida (el historial de la cuenta es público en Horizon).
   Procedimiento: [runbook](#runbook-rotación-de-la-clave-del-admin).
-- **Sin CORS**: no se emiten cabeceras `Access-Control-*`, así que los navegadores bloquean el
-  uso desde webs de terceros. La app nativa no necesita CORS.
-- **Allowlist de 6 contratos** (los 5 de RAÍZ + el SAC de USDC que exige el faucet; el SOW
-  decía "5", la desviación es esta): `submit()` rechaza cualquier otro `contractId`.
-- **Anti doble gasto** en el pipeline: reenviar el mismo envelope siempre es seguro; solo se
-  reconstruye con secuencia nueva si la tx anterior es `NOT_FOUND` y su `maxTime` venció.
-- **Nada de esto es seguridad de mainnet.** No hay firma del usuario, ni KYC, ni límites por
-  identidad. El sucesor es la custodia comunal (F3) y la firma por parte del propio usuario.
 
-### Rotación de `RELAYER_APP_KEY`
+### Qué NO impide
 
-```bash
-fly secrets set RELAYER_APP_KEY="$(openssl rand -hex 24)"   # Fly reinicia la máquina
-```
+- **Un atacante con muchas IPs.** Los cupos por IP reparten el servicio entre redes distintas; no
+  frenan a quien tiene varias (VPN, proxies; un `/48` de IPv6 son 65 536 claves). Con cinco IPs se
+  agota el faucet del día y con dos, el registro o el mint. Lo único que no puede superar son los
+  cupos globales: el daño de un día tiene techo, pero ese día los usuarios legítimos se quedan sin
+  servicio. Es una denegación barata.
+- **Vaciar el faucet.** 50 faucets diarios son 1 000 USDC, lo que aporta un re-fondeo: con abuso
+  sostenido la cuenta admin se queda sin USDC y hay que rellenarla a mano
+  ([runbook](#runbook-re-fondear-el-faucet)).
+- **Residentes y comercios falsos.** Hasta 20 de cada uno al día, y el contrato no tiene forma de
+  retirar un soulbound: bastan para distorsionar el quórum de un barrio de demo.
+- **Gastar el cupo de vault desde una sola IP.** Su cupo por IP es igual al global por defecto
+  (20): una IP puede consumir las operaciones del día y dejar la pantalla Yield sin poder mover
+  fondos hasta las 00:00 UTC. No se pierde nada, pero se bloquea.
+- **Gastar cupo con peticiones que fallan.** Lo que se rechaza al simular la transacción consume
+  cupo igualmente ([Límites y cupos](#límites-y-cupos)): 10 mints a una dirección que ya es
+  residente responden `409` y aun así agotan el cupo de mint de esa IP; desde dos IPs, el global
+  del día.
+- **Redes compartidas.** El cupo por IP es por red, no por persona: tras una NAT grande, un usuario
+  honesto puede encontrarse el cupo gastado por sus vecinos (y los 60/min, compartidos).
+- **Reinicios.** Los contadores viven en memoria: un redeploy los pone a cero.
 
-Después hay que publicar un **nuevo APK** con la key nueva (`local.properties` →
-`BuildConfig.RELAYER_APP_KEY`). Las versiones antiguas reciben `401 UNAUTHORIZED_APP`.
+### Por qué se quitó la API key
+
+Hasta la 0.2.0 los `POST` exigían una API key estática en la cabecera `x-raiz-app-key`. Esa key
+viajaba **dentro del APK** y se extrae en minutos: quien quisiera abusar la tenía, y a quien no la
+tenía ya lo frenaban los cupos. Era seguridad aparente —no autenticaba a nadie— y obligaba a
+publicar un APK con una credencial dentro, justo lo que el SOW promete que no hay ("zero secrets").
+
+En la 0.3.0 se eliminó. El relayer queda como lo que ya era en la práctica, un servicio público de
+testnet, y todo lo que lo protege está del lado del servidor; a cambio se añadieron los cupos
+diarios por IP. Los APK ya publicados siguen enviando la cabecera: el relayer la ignora.
+
+### Camino a mainnet: autenticación por wallet
+
+**Nada de lo anterior es seguridad de mainnet.** No hay firma del usuario, ni KYC, ni límites por
+identidad. Lo que falta está **planificado, no implementado**:
+
+- **Autenticación por wallet, sin secretos compartidos**:
+  [SEP-10](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0010.md) para
+  cuentas `G…` y
+  [SEP-45](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0045.md) para
+  cuentas de contrato `C…` (las wallets passkey). La wallet firma un reto y el relayer le emite una
+  **sesión JWT**.
+- **Cada petición solo puede actuar sobre la dirección autenticada**: faucet, alta de comercio o de
+  residente para *tu* dirección, no para la de otro.
+- **Cupos por wallet**, además de los de IP y los globales.
+- **KYC de residentes**
+  ([SEP-12](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0012.md)) en
+  lugar del mock: una sesión demuestra que controlas una dirección, no que vivas en el barrio.
+
+El plan detallado (decisiones de arquitectura, fases y criterios de aceptación) vive en el monorepo
+`Protocolo_Raiz`: `docs/PLAN_CLAUDE_CODE_SOW.md`, sección **WP7**. El sucesor de fondo sigue siendo
+la custodia comunal (F3), donde la autoridad admin deja de ser una sola clave.
 
 ---
 
@@ -609,7 +737,7 @@ curl -s https://horizon-testnet.stellar.org/accounts/GBLS7PL5Y65DHQIPMJO6HVQLX4F
   | jq '{thresholds, signers}'
 ```
 
-Con la API key (la del APK o una que te pase el equipo), un `POST` devuelve un `txHash`; se
+Los `POST` tampoco piden credenciales (consumen cupo real): cada uno devuelve un `txHash`, que se
 comprueba on-chain en Stellar Expert:
 
 ```
@@ -629,6 +757,23 @@ grep -r "GBLS7PL5Y65DHQIPMJO6HVQLX4FXEEHQDWHGSBUTGT4V6ZV2IOACYC2P" app-release/ 
 ```
 
 Y en este repo: `git grep -E "S[A-Z0-9]{55}"` → 0 resultados.
+
+---
+
+## Notas de versión
+
+- **0.3.0 — sin API key, cupos por IP.** Se elimina la API key estática de aplicación
+  (`RELAYER_APP_KEY`, cabecera `x-raiz-app-key`) y, con ella, el error `401 UNAUTHORIZED_APP`: el
+  relayer es un servicio público de testnet acotado por cupos del servidor
+  ([por qué](#por-qué-se-quitó-la-api-key)). A cambio, cupos diarios **por IP** en los `POST`
+  (faucet 10, registro 10, mint 10, vault 20; variables `*_PER_IP_DAILY`), visibles en `limits` de
+  `/v1/health`. Compatible con los APK ya publicados: la cabecera se ignora y `RELAYER_APP_KEY`, si
+  sigue definida, también (con un `warn` al arrancar). Cuerpos, respuestas y códigos de los `POST`
+  no cambian; solo el nombre del cupo en los `429` diarios (`details.limit` y mensaje), que ahora
+  dice `global` o `de esta red/IP`.
+- **0.2.0 — rotación de clave.** La clave que firma puede ser un firmante de la cuenta admin, no
+  solo su clave maestra (verificación on-chain al arrancar; `signer` y `signerAuthorized` en
+  `/v1/health`).
 
 ---
 

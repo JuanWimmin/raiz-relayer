@@ -4,8 +4,8 @@
 #
 # Multi-stage: la etapa `build` compila TypeScript con las devDependencies; la
 # etapa `runtime` solo lleva dependencias de producción, dist/ y config/.
-# No hay secretos aquí ni en la imagen: RELAYER_ADMIN_SECRET y RELAYER_APP_KEY
-# llegan SIEMPRE por variables de entorno en tiempo de ejecución.
+# No hay secretos aquí ni en la imagen: RELAYER_ADMIN_SECRET llega SIEMPRE por
+# variable de entorno en tiempo de ejecución.
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── Etapa 1: build ────────────────────────────────────────────────────────────

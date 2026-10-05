@@ -19,7 +19,6 @@ import { StrKey, scValToNative, type xdr } from "@stellar/stellar-sdk";
 
 export type ErrorCode =
   | "VALIDATION_ERROR"
-  | "UNAUTHORIZED_APP"
   | "NOT_FOUND"
   | "BARRIO_NOT_FOUND"
   | "BARRIO_ADMIN_NOT_SET"
@@ -43,7 +42,6 @@ export type ErrorCode =
 
 export const HTTP_BY_CODE: Record<ErrorCode, number> = {
   VALIDATION_ERROR: 400,
-  UNAUTHORIZED_APP: 401,
   NOT_FOUND: 404,
   BARRIO_NOT_FOUND: 404,
   BARRIO_ADMIN_NOT_SET: 404,

@@ -8,7 +8,9 @@
 # → txBadSeq intermitentes, reintentos inútiles y cupos duplicados. `fly deploy`
 # sin `--ha=false` crea 2 máquinas por defecto: no lo hagas.
 #
-# Secretos (nunca aquí):  fly secrets set RELAYER_ADMIN_SECRET=… RELAYER_APP_KEY=…
+# Secretos (nunca aquí):  fly secrets set RELAYER_ADMIN_SECRET=…
+# (RELAYER_APP_KEY ya no se usa desde la 0.3.0: si sigue como secret se ignora
+#  con un warn. Bórralo DESPUÉS de desplegar la 0.3.0; ver README § Docker y Fly.io.)
 
 app = "raiz-relayer"
 primary_region = "iad"  # bog (Bogotá) y mia (Miami) están deprecadas en Fly (2026); iad (Ashburn) es la región activa más cercana a Colombia

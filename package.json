@@ -1,6 +1,6 @@
 {
   "name": "raiz-relayer",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Admin relayer de RAÍZ: firma server-side los flujos admin (registro de comercios, soulbound de residentes, faucet USDC, vault) en Stellar testnet.",
   "license": "MIT",
   "private": true,

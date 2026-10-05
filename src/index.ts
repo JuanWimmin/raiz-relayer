@@ -58,10 +58,13 @@ async function main(): Promise<void> {
     }
     throw e;
   }
-  const { config, signerKeypair } = loaded;
+  const { config, signerKeypair, warnings } = loaded;
 
   const pretty = Boolean(process.stdout.isTTY) && process.env.NODE_ENV !== "production";
   const logger = createLogger(config.logLevel, pretty);
+  /* Avisos de loadConfig (hoy solo uno: RELAYER_APP_KEY sigue definida y ya
+   * no se usa). Un `warn` por aviso, una vez, al arrancar. */
+  for (const warning of warnings) logger.warn(warning);
 
   process.on("unhandledRejection", (reason) => {
     logger.fatal({ err: reason }, "unhandledRejection: el proceso se reinicia");

@@ -7,6 +7,11 @@
  * que genera el propio Fastify (404, 413, JSON malformado) y el plugin de
  * rate-limit por IP.
  *
+ * No hay autenticación: desde la 0.3.0 el relayer es un servicio público de
+ * testnet y los POST no piden API key (la cabecera `x-raiz-app-key` que aún
+ * envían los APK antiguos se ignora). Lo que acota el abuso son los cupos:
+ * por IP y minuto (plugin), por IP y día, por address y globales por día.
+ *
  * Flujo común de las rutas POST (`relay`):
  *   parseBody → [idempotencia] → check cupos (429 temprano, sin consumir)
  *   → service.X(input, { afterPreflight }) → 200 { ok:true, txHash, ledger, … }
@@ -19,10 +24,8 @@ import Fastify, {
   type FastifyInstance,
   type FastifyReply,
   type FastifyRequest,
-  type preHandlerAsyncHookHandler,
 } from "fastify";
 import rateLimit, { normalizeIP } from "@fastify/rate-limit";
-import { makeAuthHook } from "./auth.js";
 import type { Config } from "./config.js";
 import { RelayerError, isRelayerError } from "./errors.js";
 import { IdempotencyCache, hashBody } from "./idempotency.js";
@@ -65,6 +68,10 @@ export function isTrustedProxy(addr: string): boolean {
  * si no viene (local, tests), la IP del socket. Se normaliza igual que hace
  * el keyGenerator por defecto del plugin (IPv6 agrupado por /64) para que un
  * cliente IPv6 no tenga 2^64 cubos gratis.
+ *
+ * Es también la clave de los cupos DIARIOS por IP de los POST: una request
+ * sin IP resoluble cae siempre en la misma clave ("unknown"), nunca en un
+ * cubo nuevo.
  */
 export function clientIpKey(req: FastifyRequest): string {
   const raw = req.headers[CLIENT_IP_HEADER];
@@ -86,7 +93,12 @@ export interface AppDeps {
 export interface RelayOptions<T> {
   /** Ámbito de la idempotencia (= nombre de la ruta). */
   scope: string;
-  /** Cupos que la request debe respetar; se consumen todos en `afterPreflight`. */
+  /**
+   * Cupos que la request debe respetar; se consumen todos en `afterPreflight`.
+   * Si hay varios agotados, el 429 nombra el primero de la lista: las rutas
+   * ponen el diario global antes que el de la IP (si no queda cupo para nadie,
+   * el mensaje no debe sugerir que cambiar de red lo arregla).
+   */
   limits: LimitHandle[];
   /** Llamada al servicio con los hooks ya montados. */
   run: (hooks: ServiceHooks) => Promise<T>;
@@ -98,8 +110,8 @@ export interface RouteContext {
   service: StellarService;
   limits: Limits;
   idempotency: IdempotencyCache;
-  /** preHandler de autenticación por API key. */
-  auth: preHandlerAsyncHookHandler;
+  /** Clave de IP de la request para los cupos diarios por IP (= `clientIpKey`, la del limitador por minuto). */
+  clientIp(req: FastifyRequest): string;
   /** Flujo común de los POST (ver cabecera del archivo). */
   relay<T>(req: FastifyRequest, opts: RelayOptions<T>): Promise<T>;
 }
@@ -145,7 +157,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     service,
     limits,
     idempotency,
-    auth: makeAuthHook(config.appKey),
+    clientIp: clientIpKey,
     relay: (req, opts) => relay(idempotency, req, opts),
   };
 

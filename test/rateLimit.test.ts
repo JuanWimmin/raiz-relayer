@@ -123,6 +123,10 @@ describe("makeLimits", () => {
     mintDaily: 20,
     vaultDaily: 20,
     perIpPerMinute: 60,
+    faucetPerIpDaily: 2,
+    registerPerIpDaily: 1,
+    mintPerIpDaily: 1,
+    vaultPerIpDaily: 3,
   };
 
   it("faucetAddress es por address; faucetDaily es global", () => {
@@ -148,5 +152,45 @@ describe("makeLimits", () => {
     const limits = makeLimits({ rates });
     expect(limits.faucetAddress("A").name).toContain("address");
     expect(limits.faucetDaily().name).toContain("faucet");
+  });
+
+  it("los cupos por IP cuentan por IP y por grupo, sin tocar los globales, y se reinician a las 00:00 UTC", () => {
+    const clock = fakeClock(NEAR_MIDNIGHT);
+    const limits = makeLimits({ rates }, new RateLimiter({ now: clock.now }));
+    const A = "203.0.113.10";
+    const B = "203.0.113.11";
+
+    expect(limits.faucetPerIpDaily(A).consume()).toEqual({ allowed: true, remaining: 1, retryAfterMs: 0 });
+    expect(limits.faucetPerIpDaily(A).consume().allowed).toBe(true);
+    // Agotado para A: check y consume dicen que no, y faltan 60 s para medianoche UTC.
+    expect(limits.faucetPerIpDaily(A).check()).toEqual({ allowed: false, remaining: 0, retryAfterMs: 60_000 });
+    expect(limits.faucetPerIpDaily(A).consume().allowed).toBe(false);
+    expect(limits.faucetPerIpDaily(A).snapshot()).toEqual({ used: 2, remaining: 0, resetsInMs: 60_000 });
+
+    // Otra IP, otro grupo de la misma IP y el contador global siguen intactos.
+    expect(limits.faucetPerIpDaily(B).check()).toEqual({ allowed: true, remaining: 2, retryAfterMs: 0 });
+    expect(limits.registerPerIpDaily(A).check().allowed).toBe(true);
+    expect(limits.mintPerIpDaily(A).check().allowed).toBe(true);
+    expect(limits.vaultPerIpDaily(A).snapshot()).toEqual({ used: 0, remaining: 3, resetsInMs: 60_000 });
+    expect(limits.faucetDaily().snapshot().used).toBe(0);
+
+    clock.advance(60_000); // 00:00:00 UTC del día siguiente
+    expect(limits.faucetPerIpDaily(A).check()).toEqual({ allowed: true, remaining: 2, retryAfterMs: 0 });
+  });
+
+  it("los nombres distinguen el cupo de la IP ('de esta red/IP') del global ('global')", () => {
+    const limits = makeLimits({ rates });
+    const perIp = [limits.faucetPerIpDaily("x"), limits.registerPerIpDaily("x"), limits.mintPerIpDaily("x"), limits.vaultPerIpDaily("x")];
+    const global = [limits.faucetDaily(), limits.registerDaily(), limits.mintDaily(), limits.vaultDaily()];
+    for (const h of perIp) {
+      expect(h.name).toContain("de esta red/IP");
+      expect(h.name).not.toContain("global");
+    }
+    for (const h of global) {
+      expect(h.name).toContain("global");
+      expect(h.name).not.toContain("IP");
+    }
+    // Ocho nombres distintos: `details.limit` identifica el cupo sin ambigüedad.
+    expect(new Set([...perIp, ...global].map((h) => h.name)).size).toBe(8);
   });
 });

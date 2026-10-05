@@ -106,12 +106,19 @@ export function registerHealthRoute(app: FastifyInstance, ctx: RouteContext): vo
         adminUsdcStroops: snap.adminUsdcStroops,
         remainingToday: limits.faucetDaily().snapshot().remaining,
       },
+      /* Solo ENTEROS: la app publicada parsea `limits` como Map<String, Int>
+       * (acepta claves nuevas, no otros tipos). Los *PerIpDaily son los cupos
+       * diarios por IP de los POST (0.3.0). */
       limits: {
         faucetPerAddressMinutes: Math.round(config.rates.faucetPerAddressWindowMs / 60_000),
         faucetDaily: config.rates.faucetDaily,
         registerDaily: config.rates.registerDaily,
         mintDaily: config.rates.mintDaily,
         vaultDaily: config.rates.vaultDaily,
+        faucetPerIpDaily: config.rates.faucetPerIpDaily,
+        registerPerIpDaily: config.rates.registerPerIpDaily,
+        mintPerIpDaily: config.rates.mintPerIpDaily,
+        vaultPerIpDaily: config.rates.vaultPerIpDaily,
       },
       vaultEndpoints: config.vaultEndpointsEnabled,
       queue: { pending: service.queuePending() },

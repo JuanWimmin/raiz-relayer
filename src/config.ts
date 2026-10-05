@@ -4,7 +4,11 @@
  * Reglas duras (el proceso NO arranca si fallan):
  *  - RELAYER_ADMIN_SECRET presente y válido (S…).
  *  - NETWORK === "testnet". Este servicio no está pensado para mainnet.
- *  - RELAYER_APP_KEY de al menos 16 caracteres.
+ *
+ * No hay API key de aplicación: se eliminó en la 0.3.0 (viajaba en el APK y
+ * era extraíble; el relayer es un servicio público acotado por cupos). Si
+ * RELAYER_APP_KEY sigue definida en el entorno se IGNORA —ni se valida ni se
+ * guarda su valor— y `loadConfig()` devuelve un aviso para el arranque.
  *
  * Cuenta admin ≠ clave que firma. Son dos claves públicas con dos papeles:
  *  - `adminPublicKey`  = `admin` de deployments.json: la CUENTA. Es el origen
@@ -36,6 +40,10 @@ const NETWORK_PASSPHRASES = {
 /** Margen entre el peor caso del submit (deadline + una llamada RPC colgada) y el timeout duro de la cola. */
 const JOB_TIMEOUT_MARGIN_MS = 5_000;
 
+/** Aviso de arranque cuando RELAYER_APP_KEY sigue en el entorno (la variable se ignora; texto fijo, nunca su valor). */
+export const APP_KEY_UNUSED_WARNING =
+  "RELAYER_APP_KEY ya no se usa: el relayer es público con cupos; puedes borrar el secret";
+
 const boolFromEnv = z
   .string()
   .optional()
@@ -56,9 +64,6 @@ const envSchema = z.object({
     .refine((s) => StrKey.isValidEd25519SecretSeed(s), {
       message: "RELAYER_ADMIN_SECRET no es una seed ed25519 válida (S…).",
     }),
-  RELAYER_APP_KEY: z
-    .string({ error: "Falta RELAYER_APP_KEY (API key estática que usa la app)." })
-    .min(16, "RELAYER_APP_KEY debe tener al menos 16 caracteres."),
   RPC_URL: z.url().default("https://soroban-testnet.stellar.org"),
   HORIZON_URL: z.url().default("https://horizon-testnet.stellar.org"),
   PORT: intFromEnv(8080, 1),
@@ -73,6 +78,11 @@ const envSchema = z.object({
   RATE_MINT_DAILY: intFromEnv(20, 1),
   RATE_VAULT_DAILY: intFromEnv(20, 1),
   RATE_PER_IP_PER_MINUTE: intFromEnv(60, 1),
+  // Cupos diarios POR IP de los endpoints de escritura (misma clave de IP que el limitador por minuto).
+  FAUCET_PER_IP_DAILY: intFromEnv(10, 1),
+  REGISTER_PER_IP_DAILY: intFromEnv(10, 1),
+  MINT_PER_IP_DAILY: intFromEnv(10, 1),
+  VAULT_PER_IP_DAILY: intFromEnv(20, 1),
   VAULT_ENDPOINTS_ENABLED: boolFromEnv,
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
   DEPLOYMENTS_FILE: z.string().default("config/deployments.testnet.json"),
@@ -113,6 +123,12 @@ export interface RateConfig {
   mintDaily: number;
   vaultDaily: number;
   perIpPerMinute: number;
+  /** Cupos diarios por IP (día UTC): que una sola IP no agote el cupo global del día. */
+  faucetPerIpDaily: number;
+  registerPerIpDaily: number;
+  mintPerIpDaily: number;
+  /** deposit + redeem juntos. */
+  vaultPerIpDaily: number;
 }
 
 export interface Config {
@@ -127,7 +143,6 @@ export interface Config {
   adminPublicKey: string;
   /** Clave pública que deriva de RELAYER_ADMIN_SECRET: la que FIRMA (la maestra de la cuenta admin o un firmante suyo). */
   signerPublicKey: string;
-  appKey: string;
   faucetAmountStroops: bigint;
   usdcIssuer: string;
   rates: RateConfig;
@@ -179,11 +194,23 @@ export function loadDeployments(path: string): Deployments {
 /**
  * Carga y valida la configuración. Lanza ConfigError con mensaje claro; el
  * bootstrap lo imprime y sale con código 1.
+ *
+ * `warnings`: avisos que no impiden arrancar. Los emite el bootstrap como
+ * `warn` (aquí aún no hay logger: se crea con `config.logLevel`).
  */
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): { config: Config; signerKeypair: Keypair } {
+export function loadConfig(env: NodeJS.ProcessEnv = process.env): {
+  config: Config;
+  signerKeypair: Keypair;
+  warnings: string[];
+} {
   const parsed = envSchema.safeParse(env);
   if (!parsed.success) throw new ConfigError(formatZodError("Configuración inválida:", parsed.error));
   const e = parsed.data;
+
+  // RELAYER_APP_KEY ya no forma parte del esquema: si sigue definida (el
+  // secret de un despliegue anterior) no se lee su valor, solo se avisa.
+  const warnings: string[] = [];
+  if (env.RELAYER_APP_KEY !== undefined) warnings.push(APP_KEY_UNUSED_WARNING);
 
   const deployments = loadDeployments(e.DEPLOYMENTS_FILE);
 
@@ -213,7 +240,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): { config: Conf
     host: e.HOST,
     adminPublicKey: deployments.admin,
     signerPublicKey: signerKeypair.publicKey(),
-    appKey: e.RELAYER_APP_KEY,
     faucetAmountStroops: BigInt(e.FAUCET_AMOUNT_STROOPS),
     usdcIssuer: deployments.usdc_issuer,
     rates: {
@@ -223,6 +249,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): { config: Conf
       mintDaily: e.RATE_MINT_DAILY,
       vaultDaily: e.RATE_VAULT_DAILY,
       perIpPerMinute: e.RATE_PER_IP_PER_MINUTE,
+      faucetPerIpDaily: e.FAUCET_PER_IP_DAILY,
+      registerPerIpDaily: e.REGISTER_PER_IP_DAILY,
+      mintPerIpDaily: e.MINT_PER_IP_DAILY,
+      vaultPerIpDaily: e.VAULT_PER_IP_DAILY,
     },
     vaultEndpointsEnabled: e.VAULT_ENDPOINTS_ENABLED ?? true,
     logLevel: e.LOG_LEVEL,
@@ -252,12 +282,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): { config: Conf
         `(= ${config.jobDeadlineMs} + ${config.rpcRequestTimeoutMs} + ${JOB_TIMEOUT_MARGIN_MS} = ${minJobTimeoutMs}).`,
     );
   }
-  return { config, signerKeypair };
+  return { config, signerKeypair, warnings };
 }
 
-/** Versión segura para logs (sin appKey; URLs reducidas al origen por si llevan credenciales o tokens en el path). */
+/** Versión segura para logs (URLs reducidas al origen por si llevan credenciales o tokens en el path). */
 export function redactConfig(c: Config): Record<string, unknown> {
-  const { appKey: _appKey, deployments: _d, rolesByAddress: _r, ...rest } = c;
+  const { deployments: _d, rolesByAddress: _r, ...rest } = c;
   // rpcUrl/horizonUrl ya pasaron z.url(), así que `new URL` no lanza.
   return {
     ...rest,
